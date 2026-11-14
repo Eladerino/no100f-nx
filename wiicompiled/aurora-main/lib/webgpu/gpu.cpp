@@ -747,6 +747,9 @@ static wgpu::BackendType to_wgpu_backend(AuroraBackend backend) {
 }
 
 static bool create_surface() {
+  if constexpr (kSurfaceless) {
+    return true;
+  }
   SDL_Window* window = window::get_sdl_window();
   if (window == nullptr) {
     Log.error("Failed to create surface: no window");
@@ -1086,21 +1089,25 @@ bool initialize(AuroraBackend auroraBackend) {
   }
   g_queue = g_device.GetQueue();
 
-  const wgpu::Status status = g_surface.GetCapabilities(g_adapter, &g_surfaceCapabilities);
-  if (status != wgpu::Status::Success) {
-    Log.error("Failed to get surface capabilities: {}", magic_enum::enum_name(status));
-    return false;
+  auto surfaceFormat = wgpu::TextureFormat::RGBA8Unorm;
+  auto presentMode = wgpu::PresentMode::Fifo;
+  if constexpr (!kSurfaceless) {
+    const wgpu::Status status = g_surface.GetCapabilities(g_adapter, &g_surfaceCapabilities);
+    if (status != wgpu::Status::Success) {
+      Log.error("Failed to get surface capabilities: {}", magic_enum::enum_name(status));
+      return false;
+    }
+    if (g_surfaceCapabilities.formatCount == 0) {
+      Log.error("Surface has no formats");
+      return false;
+    }
+    if (g_surfaceCapabilities.presentModeCount == 0) {
+      Log.error("Surface has no present modes");
+      return false;
+    }
+    surfaceFormat = best_surface_format();
+    presentMode = best_present_mode();
   }
-  if (g_surfaceCapabilities.formatCount == 0) {
-    Log.error("Surface has no formats");
-    return false;
-  }
-  if (g_surfaceCapabilities.presentModeCount == 0) {
-    Log.error("Surface has no present modes");
-    return false;
-  }
-  auto surfaceFormat = best_surface_format();
-  auto presentMode = best_present_mode();
   uint32_t msaaSamples = g_config.msaa;
 #ifndef AURORA_DAWN_MSAA_PATCHED
   // Stock Dawn aborts on a 2x or 8x multisampled texture on Vulkan (WebGPU allows 1 and 4 only). The patched Dawn
@@ -1401,7 +1408,7 @@ bool take_vsync_change() noexcept {
 }
 
 void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, uint32_t native_height, bool force) {
-  if (!g_surface || !g_device || width == 0 || height == 0 || native_height == 0 || native_width == 0) {
+  if (!surface_ready() || !g_device || width == 0 || height == 0 || native_height == 0 || native_width == 0) {
     return;
   }
 
@@ -1448,7 +1455,9 @@ void resize_swapchain(uint32_t width, uint32_t height, uint32_t native_width, ui
   if (g_hdrActive) {
     surfaceConfiguration.format = wgpu::TextureFormat::RGBA16Float;  // render targets keep the SDR format
   }
-  g_surface.Configure(&surfaceConfiguration);
+  if (g_surface) {
+    g_surface.Configure(&surfaceConfiguration);
+  }
   if (!sizeChanged) {
     // Forced reconfigure at an unchanged size (present-mode change or recreated surface). The
     // offscreen targets are not swapchain images, so reallocating them would only stall the frame.

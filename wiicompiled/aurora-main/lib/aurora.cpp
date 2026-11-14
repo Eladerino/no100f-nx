@@ -1019,8 +1019,9 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) {
               backend_name(requestedBackend), backend_name(selectedBackend));
   }
 
-  // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend
-  if (webgpu::g_backendType == wgpu::BackendType::Null) {
+  // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend (surfaceless: ImGui still
+  // records through Dawn's Null device, and the Switch's SDL has no renderer)
+  if (webgpu::g_backendType == wgpu::BackendType::Null && !webgpu::kSurfaceless) {
     ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
   }
 #else
@@ -1074,7 +1075,7 @@ std::optional<AcquiredSurfaceTexture> acquire_surface_texture() noexcept {
     request_surface_reconfigure();
     return std::nullopt;
   }
-  if (!g_surface) {
+  if (!webgpu::surface_ready()) {
     request_surface_reconfigure();
     return std::nullopt;
   }
@@ -1184,6 +1185,22 @@ bool present_presentation_job(const PresentationJob& job) {
   std::chrono::nanoseconds scheduleWaitDuration{};
   std::chrono::nanoseconds presentDuration{};
   bool presented = false;
+  if constexpr (webgpu::kSurfaceless) {
+    // Nothing to present to: keep the schedule's pacing and drop the image.
+    if (job.presentAt != PresentClock::time_point{}) {
+      wait_until_precise(job.presentAt);
+    }
+    record_successful_present(job.interpolated, job.logicalFrame, {}, {}, {}, {}, {},
+                              std::chrono::duration_cast<std::chrono::nanoseconds>(PresentClock::now() -
+                                                                                   submissionStarted),
+                              job.duplicated, job.slidPeriods, {});
+    // The only sign of life on a screen that stays black: a line every ten seconds at 60 fps.
+    static uint64_t s_surfacelessFrames = 0;
+    if (++s_surfacelessFrames % 600 == 0) {
+      Log.info("Surfaceless: {} frames (logical frame {})", s_surfacelessFrames, job.logicalFrame);
+    }
+    return true;
+  }
   if (g_surfaceReconfigurePending.load(std::memory_order_acquire) ||
       window::native_resize_pending() || !window::is_presentable()) {
     return false;
@@ -1718,7 +1735,8 @@ bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy, bool* imgui
   const bool surfaceReconfigurePending =
       g_surfaceReconfigurePending.load(std::memory_order_acquire);
   const bool surfaceMutationRequired =
-      surfaceReconfigurePending || webgpu::vsync_change_pending() || !window::is_presentable() || !g_surface ||
+      surfaceReconfigurePending || webgpu::vsync_change_pending() || !window::is_presentable() ||
+      !webgpu::surface_ready() ||
       window::native_resize_pending() ||
       !window::native_window_size_matches(
           webgpu::g_graphicsConfig.surfaceConfiguration.width,
@@ -1743,12 +1761,12 @@ bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy, bool* imgui
         g_surfaceReconfigurePending.exchange(false, std::memory_order_acq_rel);
     const bool consumeSurfaceRecreate =
         g_surfaceRecreatePending.exchange(false, std::memory_order_acq_rel);
-    if (!g_surface || consumeSurfaceReconfigure) {
+    if (!webgpu::surface_ready() || consumeSurfaceReconfigure) {
       // Reconfigure in place unless the surface was actually lost. See
       // g_surfaceRecreatePending for why destroying a live surface here is fatal
       // while a capture overlay is attached.
       webgpu::refresh_surface(consumeSurfaceRecreate);
-      if (!g_surface) {
+      if (!webgpu::surface_ready()) {
         return false;
       }
     }
@@ -2229,7 +2247,7 @@ bool begin_frame() {
   // A surface mutation can legitimately fail preparation, and optimistic success would let GX/ImGui
   // record into a frame that was never begun, so join this path and return its real result.
   waitForSurfacePreparation =
-      !window::is_presentable() || !g_surface ||
+      !window::is_presentable() || !webgpu::surface_ready() ||
       window::native_resize_pending() || window::is_paused() ||
       !window::native_window_size_matches(
           webgpu::g_graphicsConfig.surfaceConfiguration.width,

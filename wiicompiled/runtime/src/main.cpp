@@ -98,6 +98,11 @@ extern "C" int g_gxFrameCount;
 extern "C" const char* DVDResolveHostPathForTest(const char* dvdPath);
 bool OS_HLE_InterruptsEnabled() noexcept;
 
+#if defined(__SWITCH__)
+// switch/source/fw_switch_init.cpp: the host stack, as offsets into the NRO's ELF.
+extern "C" size_t fw_switch_host_backtrace(char* out, size_t size, unsigned skip);
+#endif
+
 namespace {
 
 // Defined below, beside the fatal-log machinery.
@@ -707,6 +712,10 @@ std::string FormatHostStackTrace(unsigned framesToSkip) {
         out << ")\n";
     }
     return out.str();
+#elif defined(__SWITCH__)
+    std::string trace(4096, '\0');
+    trace.resize(fw_switch_host_backtrace(trace.data(), trace.size(), framesToSkip + 1));
+    return trace;
 #else
     (void)framesToSkip;
     return {};
@@ -785,6 +794,10 @@ void DumpHostStackTrace() {
     std::fputs(trace.c_str(), stderr);
     std::fflush(stderr);
     s_inProgress.clear();
+#elif defined(__SWITCH__)
+    const std::string trace = FormatHostStackTrace(1);
+    std::fputs(trace.c_str(), stderr);
+    std::fflush(stderr);
 #else
     RT_LOGF(RT_TAG_RUNTIME, "Host stack trace unavailable on this platform\n");
     std::fflush(stderr);
@@ -1160,7 +1173,8 @@ void InstallSehLogger() {
         SetUnhandledExceptionFilter(UnhandledSehFilter);
     }
 }
-#else
+#elif !defined(__SWITCH__)
+// Horizon has no signals: faults go to libnx's exception handler (switch/source in spm-nx).
 // POSIX counterpart to SehLogger above. Unlike Windows' AddVectoredExceptionHandler, which lets
 // GuestFlat and this module each install their own handler and defensively re-check each other,
 // sigaction only allows one handler per signal - the second registration replaces the first
@@ -1377,7 +1391,7 @@ int RuntimeMain(int argc, char** argv) {
     ConfigureWindowsFatalDialogBehavior();
     InstallSehLogger();
     WindowsTimerResolutionGuard timerResolutionGuard;
-#else
+#elif !defined(__SWITCH__)
     InstallPosixMemoryFaultHandler();
 #endif
     InitializeProcessTranscript(argc, argv);
@@ -1545,6 +1559,11 @@ int RuntimeMain(int argc, char** argv) {
 #elif defined(_WIN32)
         static constexpr std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{
             {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN},
+        }};
+#elif defined(__SWITCH__)
+        // deko3d through Dawn's Null device; Aurora picks Null by itself (BACKEND_AUTO).
+        static constexpr std::array<GraphicsBackendEntry, 1> kGraphicsBackends{{
+            {"auto", BACKEND_AUTO},
         }};
 
 #endif

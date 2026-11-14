@@ -10,7 +10,10 @@ if(NOT CMAKE_OSX_DEPLOYMENT_TARGET)
 endif()
 project(recomp_runtime)
 
-if(NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|AppleClang)$" OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
+# The Switch build keeps devkitA64's GCC as CMake's compiler (it links with libnx's specs) and compiles
+# through clang (switch/cmake/FrightWorksSwitch.cmake).
+if((NOT CMAKE_CXX_COMPILER_ID MATCHES "^(Clang|AppleClang)$" AND NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+   OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "WiiCompiled requires a 64-bit Clang toolchain")
 endif()
 
@@ -39,12 +42,18 @@ elseif(ANDROID AND CMAKE_ANDROID_ARCH_ABI STREQUAL "arm64-v8a")
     # Cross-built with the NDK. The game is a shared library (libmain.so) that SDL's Android
     # activity loads; see cmake/PublicProducts.cmake.
     set(RECOMP_PLATFORM_ANDROID TRUE)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+    # Horizon homebrew with devkitPro's toolchain; everything Switch-specific lives in ../../switch.
+    set(RECOMP_PLATFORM_SWITCH TRUE)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64|aarch64|arm64|ARM64)$")
     set(RECOMP_PLATFORM_LINUX TRUE)
 else()
     message(FATAL_ERROR
         "WiiCompiled supports 64-bit LLVM-MinGW Clang on Windows, native Linux x86_64/aarch64, "
         "Apple Clang on macOS x86_64/arm64, or the NDK for Android arm64-v8a")
+endif()
+if(RECOMP_PLATFORM_SWITCH)
+    include("${CMAKE_CURRENT_LIST_DIR}/../../switch/cmake/FrightWorksSwitch.cmake")
 endif()
 
 if(NOT CMAKE_BUILD_TYPE STREQUAL "Release")
@@ -230,7 +239,9 @@ set_property(SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp" APPEND PRO
 # ----------------------------------------------------------------------
 # Third-party: aurora-main (provides SDL3 + GPU backends)
 # ----------------------------------------------------------------------
-if(RECOMP_NATIVE_PREBUILT_DIR)
+if(RECOMP_PLATFORM_SWITCH AND FW_SWITCH_AUDIT)
+    message(STATUS "Switch audit: Aurora is not configured")
+elseif(RECOMP_NATIVE_PREBUILT_DIR)
     # Precompiled aurora + third-party archives. The source trees are still
     # present (the runtime includes aurora headers directly), they are simply
     # not compiled here.
@@ -250,6 +261,8 @@ else()
         set(DAWN_ENABLE_VULKAN OFF CACHE BOOL "" FORCE)
         set(DAWN_ENABLE_METAL ON CACHE BOOL "" FORCE)
         set(TINT_BUILD_HLSL_WRITER OFF CACHE BOOL "" FORCE)
+    elseif(RECOMP_PLATFORM_SWITCH)
+        fw_switch_dawn_backends()
     else()
         set(DAWN_ENABLE_D3D12 OFF CACHE BOOL "" FORCE)
         set(DAWN_ENABLE_VULKAN ON CACHE BOOL "" FORCE)
@@ -337,6 +350,9 @@ endif()
 if(RECOMP_PROJECT_COMPILE_DEFINITIONS)
     add_compile_definitions(${RECOMP_PROJECT_COMPILE_DEFINITIONS})
 endif()
+if(RECOMP_PLATFORM_SWITCH)
+    fw_switch_enter_project_scope()
+endif()
 
 # Runtime sources. CONFIGURE_DEPENDS costs one glob re-check per build (measured
 # at ~55 ms across the 100+ globs this build already re-verifies for SDL), and it
@@ -362,6 +378,9 @@ else()
         enable_language(ASM)
         list(APPEND SOURCES "${CMAKE_CURRENT_LIST_DIR}/src/platform/android/co_switch.S")
     endif()
+    if(RECOMP_PLATFORM_SWITCH)
+        fw_switch_runtime_sources(SOURCES)
+    endif()
 endif()
 set(RECOMP_PLATFORM_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/platform/host_platform.cpp")
 set(RECOMP_BASE_PRODUCT_SOURCE "${CMAKE_CURRENT_LIST_DIR}/src/product/base_product.cpp")
@@ -382,6 +401,8 @@ set_target_properties(recomp_platform PROPERTIES UNITY_BUILD OFF)
 
 # Keep these independent from Aurora's BUILD_TESTING option: they validate the
 # project's host-platform contracts, not Aurora's third-party test suite.
+# Host tests only: none of them runs on the console, so the Switch build skips them.
+if(NOT RECOMP_PLATFORM_SWITCH)
 enable_testing()
 if(RECOMP_BUILD_PSQ_TESTS)
     add_executable(recomp_psq_helpers_tests
@@ -608,6 +629,7 @@ if(RECOMP_PLATFORM_MACOS)
     target_compile_features(recomp_macos_external_audio_tests PRIVATE cxx_std_17)
     add_test(NAME recomp_macos_external_audio_tests COMMAND recomp_macos_external_audio_tests)
 endif()
+endif() # NOT RECOMP_PLATFORM_SWITCH
 
 # The translator emits the complete, content-addressed source graph. Consuming
 # this one manifest keeps configure independent of the 28k generated function
@@ -636,6 +658,9 @@ if(RECOMP_BUILD_PRODUCTS)
 
     set(RECOMP_RUNTIME_SOURCE_DIR "${CMAKE_CURRENT_LIST_DIR}")
     include("${CMAKE_CURRENT_LIST_DIR}/cmake/PublicProducts.cmake")
+    if(RECOMP_PLATFORM_SWITCH)
+        fw_switch_configure_products()
+    endif()
 else()
     if(RECOMP_PLATFORM_MACOS)
         # Compile-only audit of native runtime sources. It deliberately avoids
@@ -664,6 +689,9 @@ else()
             target_compile_options(recomp_macos_native_compile PRIVATE -march=x86-64-v3)
         endif()
         set_target_properties(recomp_macos_native_compile PROPERTIES UNITY_BUILD OFF)
+    endif()
+    if(RECOMP_PLATFORM_SWITCH AND FW_SWITCH_AUDIT)
+        fw_switch_add_audit_target("${SOURCES}")
     endif()
     add_custom_target(recomp_platform_paths_check DEPENDS recomp_platform)
     message(STATUS "Translated product targets disabled (RECOMP_BUILD_PRODUCTS=OFF)")
