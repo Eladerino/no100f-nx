@@ -571,63 +571,12 @@ useful:
 - Smoke test: build first, then `python tools\smoke-test.py` (add `--scenes <scene,...>` for a level you changed; section 4a); before a release, the level sweep (section 4b). Keep it short; nothing runs it automatically (no CI), so the PR says what was run, and what it could not run.
 - Open it as a draft and say plainly what you tested and what you didn't.
 
-## 10. Working on several branches at once
-
-Each task can get its own git worktree: a second folder with its own branch, build and `Play\`, sharing the big
-read-only folders (disc files, HD pack, toolchain) with the main checkout through links. Each worktree gets its own
-Claude Code session in a Windows Terminal tab; one session in the main checkout, named `coordinator`, coordinates them
-(the `parallel-work` skill). Not `main`: in SendMessage, "main" means the sender's own conversation.
-
-```powershell
-powershell -ExecutionPolicy Bypass -File tools\debug\worktree.ps1 open -Name main
-powershell -ExecutionPolicy Bypass -File tools\debug\worktree.ps1 new -Name installer -Branch feat/installer -Task "Implement #55"
-powershell -ExecutionPolicy Bypass -File tools\debug\worktree.ps1 list
-powershell -ExecutionPolicy Bypass -File tools\debug\worktree.ps1 open -Name installer
-powershell -ExecutionPolicy Bypass -File tools\debug\worktree.ps1 remove -Name installer
-```
-
-- `open -Name main` opens a tab in the main checkout running the coordinating session (`coordinator`). Ask it to
-  start, check on or finish tasks; it runs the commands below and can message the other sessions. Workers send it
-  their questions and approval requests (PRs, options, visual checks), and it answers or asks you (`AGENTS.md`:
-  "Questions go through the coordinator"). Commits and pushes to a task's own branch need no approval.
-- `new` creates `..\FrightWorks-worktrees\<name>` from `origin/main` (or checks out an existing branch) and opens a
-  tab there running `claude -n <name>` (`-NoOpen` to skip). With `-Task`, the goal goes into the worktree's `TASK.md`
-  and the session starts on it. Its first build must be a full one: `toolsuild-no100f.ps1` without
-  `-SkipTools`/`-SkipTranslate` (or `new ... -Build`).
-  The folder can be set once with `git config frightworks.worktreesDir ~/worktrees/frightworks` (`-Base`
-  overrides it).
-- `open -Name <name>` starts a closed session again: a new conversation that picks the task up from `TASK.md`
-  (`-Continue` to resume the last conversation instead). `new`/`open` start the tab without the Claude Code
-  variables of the shell that runs them, so a session started from the coordinator is its own session: listed by
-  ListAgents, its conversation saved for `-Continue`.
-- `worktree.ps1` is a thin wrapper: the work is done by `tools\debug\worktree.py` (Python 3.8+, standard library only).
-  The wrapper finds a real Python (not the Microsoft Store stub) and passes every argument through, so the commands
-  above are unchanged. `remove` unlinks every junction/symlink first (at any depth), checks none is left, and only
-  then lets git remove the folder: it never deletes recursively through a link, so `Disc\`, `toolchain\` etc. of
-  the main checkout are safe. It refuses rather than guess when it cannot list the running programs.
-- `-Model <name|full ID>` and `-Effort <low|medium|high|xhigh|max>` (on `new` and `open`, also with `-Continue`) are
-  passed to `claude` as `--model` / `--effort`, only when given. They are not remembered: a later `open` without them
-  starts on the defaults. No semicolons in `-Model` (Windows Terminal splits its command line there).
-- `TASK.md` in the worktree holds that task's notes; the agent notes (`AGENTS.md`, local, not in git) are shared.
-- To try a worktree's build, run its `Play\FrightWorks Game.exe`, or build its launcher there
-  (`toolsuild-launcher.ps1`) and run its `launcher\publish\FrightWorks.exe`: it starts that worktree's game, with its
-  own settings.
-- Builds can run side by side. Game runs share the test kit's run slots: `manual-session prepare/start`, `play-patched.ps1`, `capture-window.ps1` and `iterate.ps1` wait for a slot
-  (exclusive ones for the whole machine) while other runs, from any checkout, have the game open. Scripts only close the game they started from their own checkout; your
-  own game (launcher or `Play\` in the main checkout) is never closed by a test.
-- Never delete a worktree folder by hand: `Disc`, `texture_pack`, `toolchain` there are links, and some delete tools
-  follow links into the main checkout. `remove` unlinks them first; it refuses while the worktree has uncommitted work
-  or a program running from it (leftover dotnet build servers it stops itself), and while its Claude session runs:
-  close that tab first.
-
 ## Agent skills
 
 `.agents/skills/` has step-by-step guides for coding agents, readable by anyone (the shared rules for agents are in `.agents/REPO.md`): `hle-divergence-debug`
 (graphics and state bugs), `game-logic-debug` (60 fps, timing and gameplay bugs, dev menu, postool),
-`manual-yn-bisect` (yes/no visual bisects, the fix-only PR workflow) `audio-debug` (crackle, clicks, fuzz) and `parallel-work`
-(worktrees and their sessions, run from the coordinator).
+`manual-yn-bisect` (yes/no visual bisects, the fix-only PR workflow) and `audio-debug` (crackle, clicks, fuzz).
 
 Claude Code looks for skills in `.claude/skills/`, which is git-ignored. Run `python tools/setup-agents.py` once in each
 checkout (`py -3 tools\setup-agents.py` on Windows) to link it to `.agents/skills/`: a junction on Windows, a symlink
-elsewhere. It is safe to run again and refuses to replace a real folder that has files in it. `worktree.ps1 new` and `open` run it
-for a worktree (skipped on a branch that has no `.agents/` yet); the main checkout runs it by hand once after it has pulled `.agents/`.
+elsewhere. It is safe to run again and refuses to replace a real folder that has files in it.

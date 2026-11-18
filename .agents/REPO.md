@@ -9,7 +9,6 @@ People and agents also keep their own git-ignored `AGENTS.md` at the repo root f
 - **Read it before changing anything.**
   The skills in `.agents/skills/` go deeper: read the matching one first.
   Claude Code looks for skills in `.claude/skills/` (git-ignored): run `python tools/setup-agents.py` once per checkout to link it to `.agents/skills/`.
-  `worktree.ps1 new` and `open` do that for a worktree.
 - **Change it in the PR that makes the change true.**
   A new rule or fact ships in the same diff as the work behind it.
   Standalone corrections are fine as their own small PR.
@@ -246,16 +245,9 @@ Read the matching one first.
 - **`game-logic-debug`:** fps60, timing and gameplay (spawn spots, dev menu, live memory, particles, flicker).
 - **`manual-yn-bisect`:** locked landing plus in-game Y/N for visual checks; `strip-before-pr.md` for fix-only PRs.
 - **`audio-debug`:** crackle, clicks, fuzz, stuck loops (capture, per-stage dumps, disc reference decode).
-- **`parallel-work`:** one git worktree per task, optionally each with its own Claude Code session coordinated from the main checkout.
 
-Worktrees without sessions: `python3 tools/debug/worktree.py new --noopen --name NAME --branch BRANCH`, then build there; `list`; `remove --name NAME` when the branch is merged or dropped.
-The tools are `tools/debug/worktree.ps1` (Windows) and `worktree.py`.
-In a worktree, `Disc`, `texture_pack`, `toolchain`, `game` and `wiicompiled/Dependencies` are links to the main checkout: read only.
-Never delete a worktree folder by hand; `remove` unlinks first.
 Don't switch a checkout that has the `.claude/skills` link to a commit from before `.agents/` existed: git fails partway, after deleting tracked files.
 To build old source there, set only the paths that differ with `git restore --source=<commit> --worktree --pathspec-from-file=<list>`.
-A worktree's first build must be full.
-Never name a session `main`.
 
 ## Facts worth knowing
 

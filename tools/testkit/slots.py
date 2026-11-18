@@ -118,7 +118,7 @@ def _same_path(a, b) -> bool:
 
 def holders(state=None):
     """Live slot records ({slot, kind, pid, why, root, since, ...}), read without the mutex and without removing
-    anything: for tools that only look (worktree.py list). A file being written this moment may be missed."""
+    anything: for tools that only look. A file being written this moment may be missed."""
     slot_dir = (Path(state) if state else state_dir()) / "slots"
     out = []
     for p in sorted(slot_dir.glob("slot-*.json")):
@@ -243,7 +243,7 @@ class SlotPool:
     # ---- acquire / release -------------------------------------------------------------------------------------
     def acquire(self, why, exclusive=False, timeout=None, log=print, root=None, extra=None) -> Lease:
         """Wait for a slot (the whole machine when exclusive) and take it. TimeoutError after `timeout` seconds.
-        `root`: the checkout the run is for (worktree.py list shows it; default: the working folder). `extra`: more
+        `root`: the checkout the run is for (default: the working folder). `extra`: more
         fields for the slot file."""
         start = time.time()
         told = None
