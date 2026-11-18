@@ -219,4 +219,4 @@ Heavy Iron Studios. Unofficial fan project, not affiliated with or endorsed by t
 code or assets; the game's data is read from your own copy.
 
 # Other FrightWorks Projects
-[FrightWorks: UnMasked](https://github.com/FrightWorks/FrightWorks-unmasked)
+[COMING SOON! FrightWorks: UnMasked](https://github.com/FrightWorks/FrightWorks-unmasked)
