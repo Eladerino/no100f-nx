@@ -1,5 +1,7 @@
 # no100f-nx: Scooby-Doo! Night of 100 Frights for Nintendo Switch
 
+**This is the Nintendo Switch port of Scooby-Doo! Night of 100 Frights, based on Scooby-Doo: Refrightened by JosiahG. The original PC project lives at https://github.com/josiahg2502-glitch/Scooby-Doo-Refrightened, continued by the FrightWorks PC port at https://github.com/FrightWorks/FrightWorks-no100f. This repository is the Switch port of it, and everything here builds on their work.**
+
 An unofficial Switch port of Scooby-Doo! Night of 100 Frights (GameCube, 2002), built with WiiCompiled and Aurora static recompilation. It is not an emulator. The game's own code, from the USA GameCube disc, is translated ahead of time into native code and built as a homebrew program (a `.nro`) for a modded Switch running Atmosphère.
 
 ## Legal notice
