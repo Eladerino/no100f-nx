@@ -258,6 +258,9 @@ To build old source there, set only the paths that differ with `git restore --so
 
 **Build**
 - Adding or removing overrides, switching between branches that differ in them, or building after a patch build needs a full translate (no `-SkipTranslate`), or the game stops at boot with "Fatal Error", PC=0.
+- An override that only changes a game function's inputs or when it runs should be a wrapper: `REGISTER_NATIVE_FUNCTION_AS` takes the address over but keeps the game's function translated as `func_<address>`, which the wrapper calls (`hle_stubs.h`; example `hle/no100f_particles.cpp`).
+  A `PPC_NATIVE_OVERRIDE` removes the game's function, so it has to port all of it.
+  Check a wrapper or a rewritten override against `main` with the determinism check, at 30 and 60 fps.
 - `build-no100f.ps1` builds the translator only if `bin\Release\net10.0\Translator.Cli.dll` is missing.
   Delete `bin\Release` after translator edits, or the output comes from a stale translator.
 - An open launcher locks `Play\SDL3.dll`: the build fails at the DLL copy after the exe copy, which is harmless.
