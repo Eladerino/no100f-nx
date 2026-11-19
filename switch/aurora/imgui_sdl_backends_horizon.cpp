@@ -7,8 +7,10 @@
 // Aurora's own source.
 //
 // ProcessEvent below is real, though: the only key events in the shim's SDL queue are the ones the
-// gamepad shim synthesises (the F10 menu tap, and the pad translated to navigation keys while the
-// menu is open), and those are mapped into ImGui key events so the menus can be driven.
+// gamepad shim synthesises (the F10 menu tap), and those are mapped into ImGui key events.
+// Gamepad input takes the other path: NewFrame below polls the shim's one gamepad and feeds
+// ImGui's gamepad keys directly, because the settings menu navigates on those (its page keys
+// read ImGuiKey_GamepadL1/R1) and no SDL event ever carries them.
 #include <chrono>
 
 #include "imgui.h"
@@ -16,6 +18,7 @@
 #include "backends/imgui_impl_sdlrenderer3.h"
 
 #include <SDL3/SDL_events.h>
+#include <SDL3/SDL_gamepad.h>
 #include <SDL3/SDL_keyboard.h>
 #include <SDL3/SDL_scancode.h>
 
@@ -78,13 +81,65 @@ void ImGui_ImplSDL3_NewFrame() {
     const auto now = std::chrono::steady_clock::now();
     const float delta = std::chrono::duration<float>(now - last).count();
     last = now;
-    ImGui::GetIO().DeltaTime = delta > 0.0f ? delta : 1.0f / 60.0f;
+    ImGuiIO& io = ImGui::GetIO();
+    io.DeltaTime = delta > 0.0f ? delta : 1.0f / 60.0f;
+
+    // Feed the pad as ImGui gamepad keys, the way imgui_impl_sdl3.cpp's
+    // UpdateGamepads does: the shim's getters read the pump's latest sample,
+    // so this is the current state of the one pad, published every frame.
+    static SDL_Gamepad* gamepad = nullptr;
+    if (gamepad == nullptr) {
+        int count = 0;
+        if (SDL_JoystickID* ids = SDL_GetGamepads(&count)) {
+            if (count > 0)
+                gamepad = SDL_OpenGamepad(ids[0]);
+            SDL_free(ids);
+        }
+    }
+    if (gamepad == nullptr) {
+        io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
+        return;
+    }
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+    const auto button = [&io](ImGuiKey key, SDL_GamepadButton which) {
+        io.AddKeyEvent(key, SDL_GetGamepadButton(gamepad, which));
+    };
+    const auto analog = [&io](ImGuiKey key, SDL_GamepadAxis axis, float v0, float v1) {
+        float value = (static_cast<float>(SDL_GetGamepadAxis(gamepad, axis)) - v0) / (v1 - v0);
+        value = value < 0.0f ? 0.0f : value > 1.0f ? 1.0f : value;
+        io.AddKeyAnalogEvent(key, value > 0.1f, value);
+    };
+    button(ImGuiKey_GamepadStart, SDL_GAMEPAD_BUTTON_START);
+    button(ImGuiKey_GamepadBack, SDL_GAMEPAD_BUTTON_BACK);
+    button(ImGuiKey_GamepadFaceLeft, SDL_GAMEPAD_BUTTON_WEST);
+    button(ImGuiKey_GamepadFaceRight, SDL_GAMEPAD_BUTTON_EAST);
+    button(ImGuiKey_GamepadFaceUp, SDL_GAMEPAD_BUTTON_NORTH);
+    button(ImGuiKey_GamepadFaceDown, SDL_GAMEPAD_BUTTON_SOUTH);
+    button(ImGuiKey_GamepadDpadLeft, SDL_GAMEPAD_BUTTON_DPAD_LEFT);
+    button(ImGuiKey_GamepadDpadRight, SDL_GAMEPAD_BUTTON_DPAD_RIGHT);
+    button(ImGuiKey_GamepadDpadUp, SDL_GAMEPAD_BUTTON_DPAD_UP);
+    button(ImGuiKey_GamepadDpadDown, SDL_GAMEPAD_BUTTON_DPAD_DOWN);
+    button(ImGuiKey_GamepadL1, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER);
+    button(ImGuiKey_GamepadR1, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER);
+    analog(ImGuiKey_GamepadL2, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, 0.0f, 32767.0f);
+    analog(ImGuiKey_GamepadR2, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, 0.0f, 32767.0f);
+    button(ImGuiKey_GamepadL3, SDL_GAMEPAD_BUTTON_LEFT_STICK);
+    button(ImGuiKey_GamepadR3, SDL_GAMEPAD_BUTTON_RIGHT_STICK);
+    constexpr float kThumbDeadZone = 8000.0f;
+    analog(ImGuiKey_GamepadLStickLeft, SDL_GAMEPAD_AXIS_LEFTX, -kThumbDeadZone, -32768.0f);
+    analog(ImGuiKey_GamepadLStickRight, SDL_GAMEPAD_AXIS_LEFTX, kThumbDeadZone, 32767.0f);
+    analog(ImGuiKey_GamepadLStickUp, SDL_GAMEPAD_AXIS_LEFTY, -kThumbDeadZone, -32768.0f);
+    analog(ImGuiKey_GamepadLStickDown, SDL_GAMEPAD_AXIS_LEFTY, kThumbDeadZone, 32767.0f);
+    analog(ImGuiKey_GamepadRStickLeft, SDL_GAMEPAD_AXIS_RIGHTX, -kThumbDeadZone, -32768.0f);
+    analog(ImGuiKey_GamepadRStickRight, SDL_GAMEPAD_AXIS_RIGHTX, kThumbDeadZone, 32767.0f);
+    analog(ImGuiKey_GamepadRStickUp, SDL_GAMEPAD_AXIS_RIGHTY, -kThumbDeadZone, -32768.0f);
+    analog(ImGuiKey_GamepadRStickDown, SDL_GAMEPAD_AXIS_RIGHTY, kThumbDeadZone, 32767.0f);
 }
 
 // Aurora only takes the SDL renderer path when the window has an SDL_Renderer, which never happens
 // here (the shim's window has none).
 // FrightWorks' Aurora asks for every connected pad (lib/imgui.cpp). The Switch shim has one pad
-// slot and ImGui_ImplSDL3_NewFrame above already reads it, so there is nothing to choose.
+// slot and ImGui_ImplSDL3_NewFrame above reads it, so there is nothing to choose.
 void ImGui_ImplSDL3_SetGamepadMode(ImGui_ImplSDL3_GamepadMode, SDL_Gamepad**, int) {}
 
 bool ImGui_ImplSDLRenderer3_Init(SDL_Renderer*) { return false; }

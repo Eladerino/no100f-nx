@@ -40,9 +40,22 @@
 #endif
 
 extern "C" void fw_switch_keep_awake(bool on);
+// runtime/horizon_unistd.c: the log's write feed (null to stop it)
+extern "C" void fw_switch_set_log_tap(void (*tap)(const void* data, size_t size));
+// switch/deko/device.cpp (FW_SWITCH_DEKO builds only; null when absent)
+extern "C" __attribute__((weak)) void aurora_switch_dk_clocks(char* buf, size_t size);
 
 namespace FwDebugServer {
 namespace {
+
+// Deferred boot request (fw_switch_init.cpp's userAppInit): userAppInit runs
+// before the static constructors, so it cannot touch g_root or any other
+// constructed global in this file or in debug_server.cpp. The request is plain
+// data only (a char buffer and a flag, both zero-initialised, no constructor),
+// which is safe to write then. RuntimeMain calls fw_debug_server_boot_pending
+// after main starts, when every global here exists.
+char g_pendingRoot[256] = {};
+bool g_pendingBoot = false;
 
 std::atomic<bool> g_booted{false};
 std::atomic<bool> g_pumpRun{false};
@@ -87,6 +100,16 @@ debugsrv::Reply CmdFlush(const debugsrv::Args&) {
     return debugsrv::ok();
 }
 
+// The clocks now (switch/deko/device.cpp clocks_format): a GPU-307.2 boot shows before a measured run,
+// instead of only in the log after the close. Also written to the log as a [server] line.
+debugsrv::Reply CmdClocks(const debugsrv::Args&) {
+    if (!aurora_switch_dk_clocks) return debugsrv::err("no clock readback in this build (it comes with the deko3d renderer)");
+    char clk[128];
+    aurora_switch_dk_clocks(clk, sizeof clk);
+    std::fprintf(stderr, "[server] clocks at %lld s: %s\n", UptimeSeconds(), clk);
+    return debugsrv::ok(std::string(clk) + "\n");
+}
+
 debugsrv::Reply CmdMark(const debugsrv::Args& a) {
     std::fprintf(stderr, "[server] mark \"%s\" at %lld s\n", Joined(a).c_str(), UptimeSeconds());
     std::fflush(stderr);
@@ -127,7 +150,7 @@ debugsrv::Reply CmdReload(const debugsrv::Args&) {
 
 void PumpMain() {
 #ifdef __SWITCH__
-    svcSetThreadPriority(CUR_THREAD_HANDLE, 0x3B);
+    fw_switch_thread_lowest_priority();  // 0x3B on every application core (horizon_pthread.c)
 #endif
     const std::string path = g_root + "/UserData/Logs/stderr.log";
     std::vector<char> buf(64 << 10);
@@ -163,10 +186,15 @@ void PumpMain() {
     if (f) std::fclose(f);
 }
 
+// The log feed on the Switch: called under the log's write lock with the bytes just written.
+void LogTap(const void* data, size_t size) { debugsrv::log_tap(static_cast<const char*>(data), size); }
+
 void ThreadStart() {
 #ifdef __SWITCH__
-    // The lowest priority: the server's threads only run in the game's gaps.
-    svcSetThreadPriority(CUR_THREAD_HANDLE, 0x3B);
+    // The lowest priority: the server's threads only run in the game's gaps. On every application
+    // core, core 0 included even under guestcore (they can never preempt the game there, and on
+    // cores 1-2 alone they starved below the render and compile threads: no input injection).
+    fw_switch_thread_lowest_priority();
 #endif
 }
 
@@ -183,6 +211,7 @@ extern "C" void fw_debug_server_boot(const char* root) {
     debugsrv::add_command("info", "info                   game, backend, uptime, root", &CmdInfo);
     debugsrv::add_command("uptime", "uptime                 seconds since the server booted", &CmdUptime);
     debugsrv::add_command("flush", "flush                  flush stderr.log now", &CmdFlush);
+    debugsrv::add_command("clocks", "clocks                 CPU/GPU/memory MHz now, STOCK or not", &CmdClocks);
     debugsrv::add_command("mark", "mark <text>            a [server] mark line in the log, then a flush", &CmdMark);
     debugsrv::add_command("shot", "shot                   not in this build (null backend)", &CmdShot);
     debugsrv::add_command("warp", "warp <level>           not in this build", &CmdWarp);
@@ -203,8 +232,30 @@ extern "C" void fw_debug_server_boot(const char* root) {
     LogLine("[server] debug server listening on port 6543: dev builds only, local network, NO password "
             "(anyone who can reach the port can move files under the root and press buttons)");
     fw_switch_keep_awake(true);
+#ifdef __SWITCH__
+    // The feed: every log write as it happens (runtime/horizon_unistd.c __wrap__write_r), not the
+    // file tail. Horizon will not open stderr.log for reading while the game writes it, so the pump
+    // below found nothing and log/logtext stayed empty. Lines written before this point are only in
+    // the file. The pump stays for other hosts.
+    fw_switch_set_log_tap(&LogTap);
+#else
     g_pumpRun = true;
     g_pump = std::thread(&PumpMain);
+#endif
+}
+
+extern "C" void fw_debug_server_request_boot(const char* root) {
+    using namespace FwDebugServer;
+    if (!root) return;
+    std::snprintf(g_pendingRoot, sizeof g_pendingRoot, "%s", root);
+    g_pendingBoot = true;
+}
+
+extern "C" void fw_debug_server_boot_pending(void) {
+    using namespace FwDebugServer;
+    if (!g_pendingBoot) return;
+    g_pendingBoot = false;
+    fw_debug_server_boot(g_pendingRoot);
 }
 
 extern "C" void fw_debug_server_stop(void) {
@@ -212,6 +263,9 @@ extern "C" void fw_debug_server_stop(void) {
     if (!g_booted.load()) return;
     g_pumpRun = false;
     if (g_pump.joinable()) g_pump.join();
+#ifdef __SWITCH__
+    fw_switch_set_log_tap(nullptr);  // before the server's objects go
+#endif
     debugsrv::stop();
     fw_switch_keep_awake(false);
 }

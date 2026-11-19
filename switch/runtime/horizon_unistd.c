@@ -1,7 +1,53 @@
 // POSIX calls newlib declares but libnx does not provide, or provides only as ENOSYS stubs.
 #include <errno.h>
+#include <reent.h>
 #include <sys/stat.h>
+#include <switch.h>
 #include <unistd.h>
+
+// The log (UserData/Logs/stderr.log) is written by every thread: newlib gives each thread its own
+// stderr FILE (its own buffer and lock) over the same descriptor, and libnx's fsdev write reads the
+// descriptor's offset, writes there and then advances it, with no lock. Two threads writing at once
+// could both write at one offset (one line lost under the other) and advance it twice (a hole of stale
+// bytes): the interleaved binary junk seen in the logs. Every newlib stdio write reaches the file
+// through _write_r, which the NRO wraps (-Wl,--wrap=_write_r, cmake/FrightWorksSwitch.cmake): writes
+// to the log's descriptor (fw_switch_set_log_fd, from userAppInit after the freopen) go one at a time.
+// Other descriptors pass straight through.
+static int g_logFd = -1;
+static Mutex g_logWriteLock;  // libnx mutex: zero is unlocked, safe before the static constructors
+
+// The debug server's log feed (fw_debug_server.cpp): every byte written to the log, in file order,
+// handed over under the same lock. It replaces tailing the file, which Horizon refuses to open while
+// the game has it open for writing (the server's log/logtext came back empty). Set only once the
+// server's C++ objects exist; cleared before they go.
+static void (*volatile g_logTap)(const void* data, size_t size);
+
+void fw_switch_set_log_fd(int fd)
+{
+    g_logFd = fd;
+}
+
+void fw_switch_set_log_tap(void (*tap)(const void* data, size_t size))
+{
+    mutexLock(&g_logWriteLock);
+    g_logTap = tap;
+    mutexUnlock(&g_logWriteLock);
+}
+
+_ssize_t __real__write_r(struct _reent* r, int fd, const void* buf, size_t count);
+
+_ssize_t __wrap__write_r(struct _reent* r, int fd, const void* buf, size_t count)
+{
+    if (fd < 0 || fd != g_logFd)
+        return __real__write_r(r, fd, buf, count);
+    mutexLock(&g_logWriteLock);
+    const _ssize_t n = __real__write_r(r, fd, buf, count);
+    void (*tap)(const void*, size_t) = g_logTap;
+    if (tap != NULL && n > 0)
+        tap(buf, (size_t)n);  // must not write to the log itself (it would deadlock here)
+    mutexUnlock(&g_logWriteLock);
+    return n;
+}
 
 // Horizon has no pipes. The runtime's process transcript (main.cpp) pipes stdout and stderr through
 // a thread into console.log; when pipe() fails it puts the streams back and carries on, so stderr

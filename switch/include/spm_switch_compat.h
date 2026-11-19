@@ -30,4 +30,22 @@ typedef jmp_buf sigjmp_buf;
 #define INET6_ADDRSTRLEN 46
 #endif
 
+// Thread placement (switch/runtime/horizon_pthread.c): a thread calls fw_switch_thread_mark at its
+// start to say what it is; the dk_diag.txt keys guestcore and bgprio decide what that changes (off:
+// nothing but its boot log line). fw_switch_thread_log_current logs the calling thread's core,
+// affinity and priority.
+#define FW_THREAD_OTHER 0
+#define FW_THREAD_RENDER 1      // Aurora's frame worker and presenter (deko3d replay and present)
+#define FW_THREAD_BACKGROUND 2  // compile, cache writer, prefetch, watchdog, reaper
+#ifdef __cplusplus
+extern "C" {
+#endif
+void fw_switch_thread_mark(int kind);
+void fw_switch_thread_log_current(const char* what, const void* fn);
+// Priority 0x3B on every application core (exempt from guestcore): the debug server's threads.
+void fw_switch_thread_lowest_priority(void);
+#ifdef __cplusplus
+}
+#endif
+
 #endif // __SWITCH__

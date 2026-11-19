@@ -28,6 +28,8 @@
 #include <strings.h>
 #include <switch.h>
 
+#include "spm_switch_compat.h"  // FW_THREAD_* (also force-included; explicit for the reader)
+
 #define MINIMUM_STACK_SIZE (4u * 1024u * 1024u)
 #define THREAD_PRIORITY 0x2C
 
@@ -43,16 +45,23 @@ static atomic_int g_next_core = 1;
 // guest core and stall it; KartPadNX calls keeping compilers off the guest core its decisive
 // fix. This file runs before the renderer's diag_init (threads start at process start), so it
 // reads dk_diag.txt itself, once, on first use. What is bought is only "never on core 0":
-// with three application cores the helpers share cores 1 and 2 with the pinned GX threads.
+// helpers get ideal core 2 and mask 1-2; the render threads (fw_switch_thread_mark
+// FW_THREAD_RENDER: Aurora's frame worker and presenter, which also replays deko3d) ideal core 1.
+// bgprio (dk_diag.txt): threads marked FW_THREAD_BACKGROUND (pipeline compile/cache writer, dk
+// shader worker, DVD prefetch, stall watchdog, the reaper) drop to kBackgroundPriority, below the
+// game thread and the render threads, so they only run when those wait.
+// Both default off (the A/B on hardware picks the default); the main thread is the guest's.
+#define DIAG_PATH "/switch/no100f-nx/UserData/dk_diag.txt"
+#define BACKGROUND_PRIORITY 0x2F
 static atomic_int g_guestcore = -1; // -1 unknown, 0 off, 1 on
+static atomic_int g_bgprio = -1;
 
-static int guestcore_enabled(void)
+// One "key", "key=1" or "key=0/off/false" line of dk_diag.txt; the last mention wins.
+static int diag_key(const char* name)
 {
-    int cached = atomic_load(&g_guestcore);
-    if (cached >= 0)
-        return cached;
+    const size_t len = strlen(name);
     int on = 0;
-    FILE* f = fopen("/switch/spm-nx/UserData/dk_diag.txt", "r");
+    FILE* f = fopen(DIAG_PATH, "r");
     if (f != NULL) {
         char line[256];
         while (fgets(line, sizeof line, f) != NULL) {
@@ -60,7 +69,7 @@ static int guestcore_enabled(void)
             while (*p == ' ' || *p == '\t') p++;
             const char* key = p;
             while ((*p >= 'a' && *p <= 'z') || (*p >= '0' && *p <= '9') || *p == '_') p++;
-            if ((size_t)(p - key) != 9 || strncmp(key, "guestcore", 9) != 0)
+            if ((size_t)(p - key) != len || strncmp(key, name, len) != 0)
                 continue;
             while (*p == ' ' || *p == '\t') p++;
             if (*p == '\0' || *p == '\n' || *p == '\r') { // a bare key means on, as in device.cpp
@@ -75,27 +84,105 @@ static int guestcore_enabled(void)
         }
         fclose(f);
     }
+    return on;
+}
+
+static int guestcore_enabled(void)
+{
+    int cached = atomic_load(&g_guestcore);
+    if (cached >= 0)
+        return cached;
+    const int on = diag_key("guestcore");
     atomic_store(&g_guestcore, on);
+    return on;
+}
+
+static int bgprio_enabled(void)
+{
+    int cached = atomic_load(&g_bgprio);
+    if (cached >= 0)
+        return cached;
+    const int on = diag_key("bgprio");
+    atomic_store(&g_bgprio, on);
     return on;
 }
 
 static u32 application_core_mask(void);
 
-// The next preferred core for a helper thread with guestcore on: the application cores minus
-// core 0, dealt from the highest down (2, then 1), KartPadNX's compiler_core shape. -1 when
-// nothing is left (a one-core process), meaning keep the normal dealing.
+// The preferred core for a helper thread with guestcore on: core 2 (the render threads move to
+// core 1 when they mark themselves), else the highest application core that is not core 0. -1
+// when nothing is left (a one-core process), meaning keep the normal dealing.
 static int guestcore_next_core(void)
 {
-    static atomic_int next = 0;
     const u32 mask = application_core_mask() & ~1u;
-    int cores[3];
-    int n = 0;
-    for (int c = 2; c >= 0; c--)
+    for (int c = 2; c >= 1; c--)
         if (mask & (1u << c))
-            cores[n++] = c;
-    if (n == 0)
-        return -1;
-    return cores[atomic_fetch_add(&next, 1) % n];
+            return c;
+    return -1;
+}
+
+// Where the image starts (the code region holding this file's functions), for elf offsets.
+static uintptr_t image_base(void)
+{
+    static uintptr_t base;
+    if (base == 0) {
+        MemoryInfo info;
+        u32 page;
+        if (R_SUCCEEDED(svcQueryMemory(&info, &page, (uintptr_t)&image_base)))
+            base = (uintptr_t)info.addr;
+    }
+    return base;
+}
+
+// One boot line per thread: where it runs now and what it may use. `fn` (may be null) is its
+// start function, printed as an offset into the ELF (aarch64-none-elf-addr2line -f -C -e).
+void fw_switch_thread_log_current(const char* what, const void* fn)
+{
+    u64 tid = 0;
+    svcGetThreadId(&tid, CUR_THREAD_HANDLE);
+    s32 ideal = -1;
+    u64 mask = 0;
+    svcGetThreadCoreMask(&ideal, &mask, CUR_THREAD_HANDLE);
+    s32 prio = -1;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    const uintptr_t base = image_base();
+    const uintptr_t at = (uintptr_t)fn;
+    fprintf(stderr, "[switch] thread %llu %s: fn elf+0x%llx, on core %d, ideal %d mask 0x%x, prio 0x%X\n",
+            (unsigned long long)tid, what ? what : "start",
+            (unsigned long long)(at && base && at >= base ? at - base : at), (int)svcGetCurrentProcessorNumber(),
+            (int)ideal, (unsigned)mask, (unsigned)prio);
+}
+
+// The lowest priority (0x3B) for a thread that must only run in everyone else's gaps (the debug
+// server's threads, fw_debug_server.cpp). Such a thread can never preempt the game thread, so it keeps
+// every application core, core 0 included, even under guestcore: on cores 1-2 alone, below the render
+// and compile threads there, it starved (debug-server input injection stopped under guestcore).
+void fw_switch_thread_lowest_priority(void)
+{
+    s32 ideal = 1;
+    u64 mask = 0;
+    if (R_FAILED(svcGetThreadCoreMask(&ideal, &mask, CUR_THREAD_HANDLE)) || ideal < 0)
+        ideal = 1;
+    const u32 app = application_core_mask();
+    if ((app & (1u << ideal)) == 0)
+        ideal = __builtin_ctz(app);
+    svcSetThreadCoreMask(CUR_THREAD_HANDLE, ideal, app);
+    svcSetThreadPriority(CUR_THREAD_HANDLE, 0x3B);
+}
+
+// Called by a thread at its start (fw_switch_thread.h): FW_THREAD_RENDER moves it to core 1
+// under guestcore; FW_THREAD_BACKGROUND lowers its priority under bgprio. Logged either way.
+void fw_switch_thread_mark(int kind)
+{
+    static const char* const kNames[] = {"other", "render", "background"};
+    if (kind == 1 && guestcore_enabled()) {
+        const u32 mask = application_core_mask() & ~1u;
+        if (mask & 2u)
+            svcSetThreadCoreMask(CUR_THREAD_HANDLE, 1, mask);
+    }
+    if (kind == 2 && bgprio_enabled())
+        svcSetThreadPriority(CUR_THREAD_HANDLE, BACKGROUND_PRIORITY);
+    fw_switch_thread_log_current(kind >= 0 && kind <= 2 ? kNames[kind] : "marked", NULL);
 }
 
 struct Trampoline {
@@ -133,6 +220,7 @@ static void* trampoline(void* raw)
         core = __builtin_ctz(mask);
     svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, mask);
     svcSetThreadPriority(CUR_THREAD_HANDLE, THREAD_PRIORITY);
+    fw_switch_thread_log_current("start", (const void*)t.start);
     return t.start(t.arg);
 }
 
@@ -199,6 +287,7 @@ static void reap_remove(pthread_t t)
 static void* reaper(void* unused)
 {
     (void)unused;
+    fw_switch_thread_mark(FW_THREAD_BACKGROUND);
     for (;;) {
         Handle handles[MAX_REAP];
         pthread_t threads[MAX_REAP];

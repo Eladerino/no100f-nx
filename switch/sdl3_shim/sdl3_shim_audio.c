@@ -66,8 +66,12 @@ static void render(SDL_AudioStream* stream, s16* out) {
     }
 }
 
+// switch/runtime/horizon_pthread.c (this library compiles before the forced spm_switch_compat.h)
+void fw_switch_thread_log_current(const char* what, const void* fn);
+
 static void output_thread(void* argument) {
     SDL_AudioStream* stream = argument;
+    fw_switch_thread_log_current("audout", (const void*)output_thread);
     for (int i = 0; i < BUFFER_COUNT; ++i) {
         memset(stream->memory[i], 0, BUFFER_BYTES);
         audoutAppendAudioOutBuffer(&stream->buffers[i]);
@@ -120,8 +124,13 @@ SDL_AudioStream* SDL_OpenAudioDeviceStream(SDL_AudioDeviceID devid, const SDL_Au
         audoutExit();
         ready = false;
     }
+    // Core 2, not -2 (the process's default core, 0): at 0x2B this thread outranks the game thread
+    // (0x2C on core 0) and preempted it at every audout buffer. -2 only if the process lacks core 2.
+    u64 core_mask = 0;
+    const int audio_core =
+        R_SUCCEEDED(svcGetInfo(&core_mask, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0)) && (core_mask & 4) ? 2 : -2;
     if (ready && (R_FAILED(threadCreate(&stream->thread, output_thread, stream, NULL, 0x4000,
-                                        0x2B, -2)) ||
+                                        0x2B, audio_core)) ||
                   R_FAILED(threadStart(&stream->thread)))) {
         sdl3_shim_set_error("audio thread could not start");
         audoutStopAudioOut();

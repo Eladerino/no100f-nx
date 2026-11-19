@@ -34,6 +34,12 @@ static PadState g_pad;
 static Mutex g_lock;
 static u64 g_buttons;
 static HidAnalogStickState g_sticks[2];
+// The pump's result for the getters (SDL_GetGamepadButton/Axis), published with atomics at the end
+// of each pump: PADRead asks for every button separately, and taking g_lock per query cost ~6% of the
+// game thread in a profile. Each value is whole (64/32-bit atomics); a reader may see the sticks of
+// one pump with the buttons of the next, which is the same as polling a moment later.
+static u64 g_pub_buttons;
+static s32 g_pub_sticks[4];  // left x, left y, right x, right y
 
 // Six-axis motion: player 1's devices in the pump's priority order (the handheld
 // sensor, a Pro Controller, paired Joy-Cons left then right). The pump stashes the
@@ -243,6 +249,12 @@ void sdl3_shim_gamepad_pump(void) {
         g_sticks[1].x = sticks[2], g_sticks[1].y = sticks[3];
     }
     g_buttons = minus_menu_filter(buttons);
+    // The lock-free copy the getters read (see g_pub_buttons).
+    __atomic_store_n(&g_pub_sticks[0], g_sticks[0].x, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pub_sticks[1], g_sticks[0].y, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pub_sticks[2], g_sticks[1].x, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pub_sticks[3], g_sticks[1].y, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pub_buttons, g_buttons, __ATOMIC_RELEASE);
     // Motion, beside the buttons it belongs with: the newest state of the first
     // connected sensor (hidGetSixAxisSensorStates returns newest first, so one
     // state is the latest). A sensor whose sampling number stops advancing goes
@@ -298,9 +310,7 @@ SDL_Gamepad* sdl3_shim_gamepad_if_open(void) { return g_open > 0 ? &g_gamepad : 
 bool SDL_GetGamepadButton(SDL_Gamepad* gamepad, SDL_GamepadButton button) {
     if (gamepad != &g_gamepad)
         return false;
-    mutexLock(&g_lock);
-    const u64 buttons = g_buttons;
-    mutexUnlock(&g_lock);
+    const u64 buttons = __atomic_load_n(&g_pub_buttons, __ATOMIC_ACQUIRE);
     for (size_t i = 0; i < sizeof kButtons / sizeof kButtons[0]; ++i) {
         if (kButtons[i].button == button)
             return (buttons & kButtons[i].mask) != 0;
@@ -322,11 +332,11 @@ static Sint16 stick_axis(s32 value, bool invert) {
 Sint16 SDL_GetGamepadAxis(SDL_Gamepad* gamepad, SDL_GamepadAxis axis) {
     if (gamepad != &g_gamepad)
         return 0;
-    mutexLock(&g_lock);
-    const u64 buttons = g_buttons;
-    const HidAnalogStickState left = g_sticks[0];
-    const HidAnalogStickState right = g_sticks[1];
-    mutexUnlock(&g_lock);
+    const u64 buttons = __atomic_load_n(&g_pub_buttons, __ATOMIC_ACQUIRE);
+    const HidAnalogStickState left = {__atomic_load_n(&g_pub_sticks[0], __ATOMIC_RELAXED),
+                                      __atomic_load_n(&g_pub_sticks[1], __ATOMIC_RELAXED)};
+    const HidAnalogStickState right = {__atomic_load_n(&g_pub_sticks[2], __ATOMIC_RELAXED),
+                                       __atomic_load_n(&g_pub_sticks[3], __ATOMIC_RELAXED)};
     switch (axis) {
     case SDL_GAMEPAD_AXIS_LEFTX: return stick_axis(left.x, false);
     case SDL_GAMEPAD_AXIS_LEFTY: return stick_axis(left.y, true);

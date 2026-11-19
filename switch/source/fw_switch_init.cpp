@@ -153,12 +153,23 @@ void spm_switch_tls_check_main_thread(void);
 void spm_switch_guest_memory_release(void);
 // source/fw_debug_server.cpp: starts the debug server (dev builds, FW_SWITCH_DEBUG_SERVER), and
 // stops it so its threads are gone before the socket service closes below. Stop is inert when the
-// server never started.
+// server never started. The boot itself is deferred: userAppInit only requests it
+// (fw_debug_server_request_boot, plain data only, safe before the static constructors) and
+// RuntimeMain in the runtime runs fw_debug_server_boot_pending once they have run.
 void fw_debug_server_boot(const char* root);
+void fw_debug_server_request_boot(const char* root);
+void fw_debug_server_boot_pending(void);
 void fw_debug_server_stop(void);
 // switch/sdl3_shim/sdl3_shim_events.c: queues the SDL quit the frame loop turns into the
 // normal shutdown (ExitForAuroraWindowClose -> userAppExit). Safe from any thread, once.
 void sdl3_shim_request_quit(void);
+// runtime/horizon_unistd.c: the log's descriptor, whose writes the _write_r wrap serializes.
+void fw_switch_set_log_fd(int fd);
+// source/pgo_instr_switch.c: the instrumented-PGO capture build's profile writer,
+// linked only into that build (FrightWorksSwitch.cmake FW_PGO_INSTRUMENT); weak, so
+// null in every other build.
+void fw_pgo_instr_start(void) __attribute__((weak));
+void fw_pgo_instr_dump_now(void) __attribute__((weak));
 
 // The exception handler runs on its own stack: the faulting thread's may be the problem.
 alignas(16) u8 __nx_exception_stack[0x4000];
@@ -206,14 +217,19 @@ void userAppInit(void) {
     MakeDirectory(kLogs);
     if (std::freopen(kStderrLog, "w", stderr) != nullptr) {
         std::setvbuf(stderr, nullptr, _IOLBF, 0);  // line-buffered: a crash keeps the last lines
+        fw_switch_set_log_fd(fileno(stderr));      // every thread's writes to it, one at a time
     }
     spm_switch_tls_check_main_thread();
+    // The PGO capture build starts its dump thread now that the SD layout and stderr exist.
+    if (fw_pgo_instr_start) fw_pgo_instr_start();
     setenv("WIICOMPILED_RUNTIME_DIR", kRoot, 1);
     setenv("WIICOMPILED_DATA_DIR", kUserData, 1);
 
     g_sockets = R_SUCCEEDED(socketInitializeDefault());
     svcGetThreadId(&g_mainThreadId, CUR_THREAD_HANDLE);
     ImageBase();
+    // The game thread's own core/affinity/priority line (horizon_pthread.c logs every other thread).
+    fw_switch_thread_log_current("main (guest scheduler)", nullptr);
 
     // Lock exit, so a close from the HOME menu arrives as an ExitRequest (with
     // 15 s to act on it) instead of the system ending the process with nothing
@@ -237,7 +253,13 @@ void userAppInit(void) {
         std::fprintf(stderr, "[switch] appletLockExit failed (rc 0x%x): a HOME close will skip shutdown\n", lockRc);
 #if FW_SWITCH_DEBUG_SERVER
     if (g_sockets) {
-        fw_debug_server_boot(kRoot);
+        // Do not boot the server here: libnx runs the static constructors after
+        // userAppInit, so the server's C++ globals (its command map, log buffer
+        // and strings) do not exist yet, and the first add_command crashed on a
+        // zeroed std::map (crash-2, Nov 14, 2026). Request the boot instead: it
+        // only writes a plain char buffer and a flag. RuntimeMain performs the
+        // actual boot once main is running (fw_debug_server_boot_pending).
+        fw_debug_server_request_boot(kRoot);
     } else {
         std::fprintf(stderr, "[switch] debug server not started: sockets are off\n");
     }
@@ -250,6 +272,15 @@ void fw_switch_keep_awake(bool on) {
     appletSetAutoSleepDisabled(on);
 }
 
+// The runtime's stall service (wiicompiled/runtime/src/hle/vi.cpp) reads this
+// between burst rounds so it never delivers guest callbacks into a process that
+// is already exiting: g_exitingThread itself has internal linkage, so this is
+// its only window out of this file. Declared weak on the runtime side, so a
+// frontend without this exit path leaves the check permanently false.
+extern "C" bool fw_switch_exiting(void) {
+    return g_exitingThread.load(std::memory_order_relaxed) != 0;
+}
+
 void userAppExit(void) {
     // After main() and the static destructors. A thread still running (the fatal exit leaves
     // Aurora's alive) may touch guest memory once it is unmapped; the crash handler parks it.
@@ -260,6 +291,10 @@ void userAppExit(void) {
     // The debug server stops first: its threads touch nothing the release unmaps, but they
     // hold the listening socket the socketExit below is about to close under them.
     fw_debug_server_stop();
+    // The PGO capture build's final dump comes before the guest memory release: its
+    // counters live in instrumented code and data the release does not touch, but
+    // nothing after this point is guaranteed to run.
+    if (fw_pgo_instr_dump_now) fw_pgo_instr_dump_now();
     spm_switch_guest_memory_release();
     std::fprintf(stderr, "[switch] userAppExit: clean shutdown done\n");
     std::fflush(stderr);

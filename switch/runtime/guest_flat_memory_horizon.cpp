@@ -19,6 +19,14 @@
 // intercepted (nothing in this build registers one), and the executable-write guard is gone. MMIO
 // writes still reach GX HLE through the inline check in memory_access.h.
 //
+// The one exception, ported from the desktop flat view (runtime/src/guest_flat_memory.cpp): the
+// non-GPU register blocks at 0xCC000000 and 0xCD000000 (64 KiB each) are plain read/write memory, a
+// register file that returns what was written, because this game's 2002 SDK reads hardware
+// registers inline (OSInit reads the PI revision at 0xCC00302C itself) and no function-level hook
+// can catch those accesses; without the mapping, the first one is a data abort (crash-3, Nov 14,
+// 2026). The PI revision is seeded as a retail GameCube reports it, and the gather-pipe page at
+// offset 0x8000 in each block stays unmapped. NO100F_MMIO_STRICT=1 restores trap-on-access.
+//
 // HostPointer() gives every mirror of a store the same pointer, into its primary view, which is what
 // the bring-up mode below always did.
 //
@@ -65,6 +73,10 @@ constexpr size_t kAllocationGranularity = 0x10000;  // 64 KiB, as the desktop ma
 // block as the memory under it. Where the heap's physical memory allows, the kernel can then map the
 // views with 2 MiB blocks instead of 4 KiB pages: fewer TLB misses across 155 MiB of guest RAM.
 constexpr size_t kLargePage = 0x200000;
+// The MMIO register file's geometry (InitializeLocked): 64 KiB blocks at 0xCC000000 and
+// 0xCD000000, with the gather-pipe page at offset 0x8000 left unmapped in each.
+constexpr uint32_t kMmioBlockSize = 0x10000;
+constexpr uint32_t kMmioHoleOffset = 0x8000;
 
 struct Store {
     Backing backing = Backing::Owned;
@@ -72,6 +84,7 @@ struct Store {
     uint64_t size = 0;
     uint32_t primary = 0;      // guest address of the view the heap block is mapped at
     bool hasPrimary = false;
+    bool mmio = false;         // the synthetic MMIO register-file store (InitializeLocked)
     uint8_t* heap = nullptr;   // the block itself
     uint8_t* host = nullptr;   // where runtime code reaches it: the primary view (or the heap block)
     bool codeMapped = false;
@@ -211,6 +224,20 @@ void MapMirror(View& view, const Store& store) {
     view.mapped = true;
 }
 
+// Best effort: the gather-pipe page inside the MMIO register file stays inaccessible, as on the
+// desktop (which protects it back to no-access). Losing the trap is not worth failing the boot.
+void ProtectGatherPipePage() {
+    for (const uint32_t block : {0xCC000000u, 0xCD000000u}) {
+        const Result rc = svcSetProcessMemoryPermission(
+            g_self, reinterpret_cast<u64>(g_window + block + kMmioHoleOffset), kGuestPageSize,
+            Perm_None);
+        if (R_FAILED(rc)) {
+            std::fprintf(stderr, "[switch] guest memory: gather-pipe page stays readable: %s\n",
+                         SvcError("svcSetProcessMemoryPermission", rc).c_str());
+        }
+    }
+}
+
 bool UnmapMirror(View& view, const Store& store) {
     const Result rc = svcUnmapProcessMemory(g_window + view.guestBase, g_self,
                                             reinterpret_cast<u64>(store.host + view.offset), view.mapSize);
@@ -277,6 +304,13 @@ void MapMirror(View& view, const Store& store) {
     view.mapped = true;
 }
 
+void ProtectGatherPipePage() {
+    for (const uint32_t block : {0xCC000000u, 0xCD000000u}) {
+        mmap(g_window + block + kMmioHoleOffset, kGuestPageSize, PROT_NONE,
+             MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    }
+}
+
 bool UnmapMirror(View& view, const Store&) {
     view.mapped = false;
     return true;
@@ -313,6 +347,22 @@ void ReleaseLocked() {
     Stores().clear();
     Views().clear();
     Layout().clear();
+}
+
+bool MmioStrict() {
+    const char* strict = std::getenv("NO100F_MMIO_STRICT");
+    return strict && *strict == '1';
+}
+
+// The PI revision a retail GameCube reports (Dolphin's value), big-endian, seeded into the
+// register file at 0xCC00302C, as the desktop flat view and the checked register file both do.
+void SeedMmioRegisterFile() {
+    static constexpr uint8_t kPiRevision[4] = {0x24, 0x65, 0x00, 0xB1};
+    for (auto& store : Stores()) {
+        if (store.mmio && store.primary == 0xCC000000u && store.host != nullptr) {
+            std::memcpy(store.host + 0x302C, kPiRevision, sizeof(kPiRevision));
+        }
+    }
 }
 
 void InitializeLocked(const std::vector<RegionRequest>& regions) {
@@ -366,6 +416,42 @@ void InitializeLocked(const std::vector<RegionRequest>& regions) {
         }
     }
 
+    // The MMIO register file (flat mode only; in checked mode the register file lives in
+    // memory.cpp). Not RegionRequests: one synthetic store per block, appended here with their
+    // views so ReleaseLocked unmaps them with the rest. Two stores, not one store plus mirror
+    // views: a mirror's destination may not overlap its own store's primary mapping on Horizon
+    // (svcMapProcessMemory 0xD401 on the first attempt, Nov 14, 2026), and the desktop's CC and
+    // CD pages are independent memory anyway. Each block's 0x8000 page is left out of the views
+    // and protected back to no-access after mapping (ProtectGatherPipePage).
+    bool mmioAdded = false;
+    if (!RequiresCheckedAccess() && !MmioStrict()) {
+        for (const uint32_t block : {0xCC000000u, 0xCD000000u}) {
+            Store store;
+            store.backing = Backing::Owned;
+            store.size = kMmioBlockSize;
+            store.primary = block;
+            store.hasPrimary = true;
+            store.mmio = true;
+            const size_t index = Stores().size();
+            Stores().push_back(store);
+            const auto addView = [index](uint32_t base, uint64_t size, uint64_t offset) {
+                View view;
+                view.guestBase = base;
+                view.guestSize = size;
+                view.mapSize = RoundUp(size, kGuestPageSize);
+                view.offset = offset;
+                view.store = index;
+                view.mirror = false;
+                Views().push_back(view);
+            };
+            addView(block, kMmioHoleOffset, 0);
+            addView(block + kMmioHoleOffset + kGuestPageSize,
+                    kMmioBlockSize - kMmioHoleOffset - kGuestPageSize,
+                    kMmioHoleOffset + kGuestPageSize);
+        }
+        mmioAdded = true;
+    }
+
     for (auto& store : Stores()) {
         store.heap = static_cast<uint8_t*>(
             std::aligned_alloc(kLargePage, static_cast<size_t>(RoundUp(store.size, kLargePage))));
@@ -392,6 +478,10 @@ void InitializeLocked(const std::vector<RegionRequest>& regions) {
             if (view.mirror) MapMirror(view, Stores()[view.store]);
         }
         spm_switch_set_flat_guest_base(g_window);
+        if (mmioAdded) {
+            ProtectGatherPipePage();
+            SeedMmioRegisterFile();
+        }
     }
 }
 
@@ -412,6 +502,7 @@ void Initialize(const std::vector<RegionRequest>& regions) {
         }
         // Re-init keeps the stores and clears them, like the desktop build.
         for (auto& store : Stores()) std::memset(store.host, 0, static_cast<size_t>(store.size));
+        SeedMmioRegisterFile();
         return;
     }
 
