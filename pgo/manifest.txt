@@ -1,0 +1,9 @@
+# no100f-nx PGO profile manifest (trimmed Aurora scope). Written by build-switch.sh --variant pgo-trim;
+# the --variant pgo manifest.txt is the untrimmed capture build's and is not touched.
+region=GIHE78-USA
+commit=ae442e15ddac46b2b21932141eb855920c0c3d7a
+tree_dirty=1
+clang_major=19
+scope=game+runtime+aurora-trim-spm7
+shards_fingerprint=41dfd9e14281859d6b0f7a027f3af0d6fec2ca7258cce999c6b2b73349c3711c
+trained_utc=2026-11-18T05:49:58Z
