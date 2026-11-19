@@ -105,8 +105,13 @@ void AuroraSetWidePerspectiveAspect(float aspect);
 void AuroraSetTexturePatches(bool enabled);
 // GX decoding time, renderer-lock wait and draw count since the last call (profiling).
 void AuroraTakeGxStats(uint64_t* processNanos, uint64_t* lockNanos, uint64_t* draws);
-// Time spent processing GX commands since start (NO100F_LOG_FPS only; else 0).
+// Time spent processing GX commands since start (Windows and Switch always, elsewhere NO100F_LOG_FPS
+// only; else 0), and the part of it spent waiting for the renderer lock.
 uint64_t AuroraGxProcessNanosTotal(void);
+uint64_t AuroraGxLockNanosTotal(void);
+// Per-stage gx timer totals since start (NO100F_STAGE_TIMERS; all zero while the timers are off).
+void AuroraStageTimerTotals(uint64_t* admitNs, uint64_t* resolveNs, uint64_t* uploadNs,
+                            uint64_t* uniformNs, uint64_t* recordNs, uint64_t* bboxNs);
 // GXCopyTex calls and the new GPU textures they needed, since the last call (profiling).
 void AuroraTakeCopyStats(uint64_t* copies, uint64_t* creates);
 

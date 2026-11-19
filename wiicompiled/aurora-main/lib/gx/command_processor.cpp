@@ -331,10 +331,32 @@ static inline f32 read_f32(const u8* ptr, bool bigEndian) {
   return val;
 }
 
+// NO100F 60 fps campaign instruments (PHASE1-DESK sections 1.4 and 2.5): cumulative counters for the
+// bounding-box accumulate and the pipeline memo. Plain relaxed atomics, always on, read back
+// through the aurora_*_totals getters beside aurora_storage_cache_totals. The stage-timer
+// atomics live here too; the timers themselves are defined after ProcessTimer below.
+std::atomic<uint64_t> g_statBBoxArmedVerts{0};   // vertices walked by gx_bbox_accumulate
+std::atomic<uint64_t> g_statBBoxAccumCalls{0};   // accumulate calls that passed the armed guard
+std::atomic<uint64_t> g_statBBoxDisarms{0};      // GXCopyDisp disarms (armed windows discarded unread)
+std::atomic<uint64_t> g_statPipelineBumps{0};    // mark_pipeline_state_dirty() calls
+std::atomic<uint64_t> g_statMemoHits{0};         // resolve_pipeline_state memo hits (all variants)
+std::atomic<uint64_t> g_statMemoMisses{0};       // resolve_pipeline_state memo misses
+std::atomic<uint64_t> g_statPipelineTableHits{0};    // cached_pipeline_state table hits
+std::atomic<uint64_t> g_statPipelineTableMisses{0};  // cached_pipeline_state table misses
+std::atomic<uint64_t> g_statStageAdmitNanos{0}, g_statStageAdmitCalls{0};
+std::atomic<uint64_t> g_statStageResolveNanos{0}, g_statStageResolveCalls{0};
+std::atomic<uint64_t> g_statStageUploadsNanos{0}, g_statStageUploadsCalls{0};
+std::atomic<uint64_t> g_statStageUniformNanos{0}, g_statStageUniformCalls{0};
+std::atomic<uint64_t> g_statStageRecordNanos{0}, g_statStageRecordCalls{0};
+std::atomic<uint64_t> g_statStageBBoxNanos{0}, g_statStageBBoxCalls{0};
+
 // Marks draw state dirty *and* invalidates the resolved-pipeline memo.
 static inline void mark_pipeline_state_dirty() noexcept {
   g_gxState.stateDirty = true;
   g_gxState.pipelineStateGeneration = next_gx_state_epoch();
+  // Instrument (PHASE1-DESK section 2.5): the flatTest diagnostic's four direct epoch assignments
+  // bypass this helper on purpose and stay uncounted.
+  g_statPipelineBumps.fetch_add(1, std::memory_order_relaxed);
 }
 
 // Rejects a malformed XF write in release builds.
@@ -577,12 +599,15 @@ static bool handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian);
 // decoded, for the runtime's NO100F_LOG_FPS breakdown.
 std::atomic<uint64_t> g_statProcessNanos{0}, g_statLockNanos{0}, g_statDraws{0};
 std::atomic<uint64_t> g_statProcessTotalNanos{0};  // never reset: slow-frame breakdowns take deltas
+std::atomic<uint64_t> g_statLockTotalNanos{0};     // never reset: the renderer-lock share of the above
 thread_local int t_statDepth = 0;  // only the outermost of nested process()/raw draws counts
 // Timed on Windows always (the slow-frame log splits a frame into GX and the rest), elsewhere only
 // while the runtime logs frame times (NO100F_LOG_FPS): two clock reads per outermost call add up on a
 // phone. Read at first use: on Android the runtime sets the variable from a property after startup.
+// The Switch times always too: its clock read is one cntpct_el0 read, and without it the slow-frame
+// line's gx bucket read 0.00 there.
 static bool StatTiming() {
-#if defined(_WIN32)
+#if defined(_WIN32) || defined(__SWITCH__)
   return true;
 #else
   static const bool on = std::getenv("NO100F_LOG_FPS") != nullptr;
@@ -605,6 +630,44 @@ struct ProcessTimer {
                                    std::memory_order_relaxed);
     }
   }
+};
+
+// Called from GXCopyDisp (GXFrameBuffer.cpp) when a frame ends with the box still armed.
+void note_bbox_disarm() { g_statBBoxDisarms.fetch_add(1, std::memory_order_relaxed); }
+
+// Per-stage gx timers (PHASE1-DESK section 3): one gated RAII timer in the ProcessTimer mould. The
+// gate is NO100F_STAGE_TIMERS, read once; while unset every hook is one predictable branch on
+// the cached bool. stop() ends a span early (the destructor is then a no-op), which the
+// multi-part spans in handle_draw_unmerged use. The remainder (process minus the timed spans)
+// is computed at print time in the runtime, so the packet loop gets no clock reads at all.
+static bool StageTimersOn() {
+  static const bool on = std::getenv("NO100F_STAGE_TIMERS") != nullptr;
+  return on;
+}
+static uint64_t StageClockNowNs() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+}
+struct StageTimer {
+  std::atomic<uint64_t>* nanos = nullptr;
+  uint64_t start = 0;
+  bool on = false;
+  StageTimer(std::atomic<uint64_t>& n, std::atomic<uint64_t>& calls) : nanos(&n), on(StageTimersOn()) {
+    if (on) {
+      calls.fetch_add(1, std::memory_order_relaxed);
+      start = StageClockNowNs();
+    }
+  }
+  void stop() {
+    if (on) {
+      on = false;
+      nanos->fetch_add(StageClockNowNs() - start, std::memory_order_relaxed);
+    }
+  }
+  ~StageTimer() { stop(); }
+  StageTimer(const StageTimer&) = delete;
+  StageTimer& operator=(const StageTimer&) = delete;
 };
 
 // Debugging: NO100F_MERGE_SUSPECTS logs register writes that changed a value but left the state
@@ -633,9 +696,10 @@ uint32_t process(const u8* data, u32 size, bool bigEndian) {
   const auto lockStart = StatTiming() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
   std::lock_guard gpuLock(aurora::renderer_gpu_mutex());
   if (StatTiming()) {
-    g_statLockNanos.fetch_add(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - lockStart).count(),
-        std::memory_order_relaxed);
+    const auto lockNanos =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - lockStart).count();
+    g_statLockNanos.fetch_add(lockNanos, std::memory_order_relaxed);
+    g_statLockTotalNanos.fetch_add(lockNanos, std::memory_order_relaxed);
   }
   u32 pos = 0;
 
@@ -744,6 +808,7 @@ uint32_t process(const u8* data, u32 size, bool bigEndian) {
       ++g_arrayUploadEpoch;
       for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
         g_gxState.arrays[i].cachedRange = {};
+        g_gxState.arrays[i].uploadedValid = false;
       }
       // A merged draw retains its previous array uploads. Force a new draw so
       // handle_draw_unmerged observes the invalidation and uploads fresh data.
@@ -2081,11 +2146,32 @@ static u32 calculate_last_vtx_size(GXVtxFmt fmt) {
   return vtxSize;
 }
 
+// usedrange (NO100F_USED_RANGE, default off): per indexed attribute, the (min, max) vertex
+// index a draw actually uses. handle_draw_unmerged uploads only that slice of each array and
+// stages the shader's array base pre-biased by min*stride, so fetches land on the same bytes
+// as a whole-array upload while the unused head and tail are never copied.
+struct AttrIndexRange {
+  u32 lo = 0;
+  u32 hi = 0;
+  bool valid = false;  // false: unknown, the caller must upload the whole array
+};
+constexpr int kIndexAttrCount = GX_VA_TEX7 - GX_VA_POS + 1;
+
+static bool used_range_enabled() noexcept {
+  static const bool enabled = [] {
+    const char* v = std::getenv("NO100F_USED_RANGE");
+    return v != nullptr && v[0] == '1';
+  }();
+  return enabled;
+}
+
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                                  gfx::Range vertRange, uint16_t usedPnMtxMask,
                                  HashType matrixTopologySignature,
                                  HashType geometrySignature, bool interpolationIdentityActive,
-                                 std::span<const float> particleDepths = {});
+                                 std::span<const float> particleDepths = {},
+                                 const uint8_t* vertices = nullptr, u32 vtxSize = 0,
+                                 const AttrIndexRange* attrRanges = nullptr);
 
 // The per-draw geometry signature, matrix-usage mask and draw-identity hashes exist purely to feed frame interpolation (build_uniform consumes them only after its `frame_interpolation_fps() == 0` early-out).
 static inline bool frame_interpolation_identity_needed() noexcept {
@@ -2116,6 +2202,71 @@ static uint32_t matrix_index_prefix_size(GXVtxFmt fmt) noexcept {
     }
   }
   return size;
+}
+
+// The draw's used index range per indexed attribute, from one walk of the raw vertex stream.
+// Tuple offsets mirror calculate_last_vtx_size exactly (including the NBT3 normal's three
+// indices per vertex, all folded into the range). An attribute whose covered range reaches
+// 95% of its array is reported as the full range and stops being tracked: the walk's cost
+// stays capped and the upload falls back to whole for it. Returns false when the stream
+// layout cannot be trusted (the accumulated tuple size disagrees with vtxSize).
+static bool attr_index_ranges(GXVtxFmt fmt, const uint8_t* verts, u32 count, u32 vtxSize,
+                              AttrIndexRange* out) {
+  for (int k = 0; k < kIndexAttrCount; ++k) out[k] = {};
+  if (verts == nullptr || count == 0 || vtxSize == 0) return false;
+  const auto& vtxFmt = g_gxState.vtxFmts[fmt];
+  u32 offsets[GX_VA_MAX_ATTR] = {};
+  u32 total = 0;
+  for (int i = GX_VA_PNMTXIDX; i <= GX_VA_TEX7; ++i) {
+    const auto attr = static_cast<GXAttr>(i);
+    const auto& attrFmt = vtxFmt.attrs[i];
+    offsets[i] = total;
+    switch (g_gxState.vtxDesc[i]) {
+    case GX_NONE:
+      break;
+    case GX_DIRECT:
+      total += comp_type_size(attr, attrFmt.type) * comp_cnt_count(attr, attrFmt.cnt);
+      break;
+    case GX_INDEX8:
+      total += (attr == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3) ? 3 : 1;
+      break;
+    case GX_INDEX16:
+      total += (attr == GX_VA_NRM && attrFmt.cnt == GX_NRM_NBT3) ? 6 : 2;
+      break;
+    }
+  }
+  if (total != vtxSize) return false;
+  bool full[kIndexAttrCount] = {};
+  for (u32 v = 0; v < count; ++v) {
+    const uint8_t* base = verts + static_cast<size_t>(v) * vtxSize;
+    for (int i = GX_VA_POS; i <= GX_VA_TEX7; ++i) {
+      const int k = i - GX_VA_POS;
+      if (full[k]) continue;
+      const GXAttrType desc = g_gxState.vtxDesc[i];
+      if (desc != GX_INDEX8 && desc != GX_INDEX16) continue;
+      const auto& array = g_gxState.arrays[i];
+      const uint8_t* p = base + offsets[i];
+      const int nIdx = (i == GX_VA_NRM && vtxFmt.attrs[i].cnt == GX_NRM_NBT3) ? 3 : 1;
+      AttrIndexRange& r = out[k];
+      for (int j = 0; j < nIdx; ++j) {
+        const u32 idx = desc == GX_INDEX8 ? p[j] : u32((p[2 * j] << 8) | p[2 * j + 1]);
+        if (!r.valid) {
+          r.lo = r.hi = idx;
+          r.valid = true;
+        } else {
+          r.lo = std::min(r.lo, idx);
+          r.hi = std::max(r.hi, idx);
+        }
+      }
+      if (array.stride != 0 && array.size != 0 &&
+          static_cast<uint64_t>(r.hi - r.lo + 1) * array.stride * 20 >= static_cast<uint64_t>(array.size) * 19) {
+        r.lo = 0;
+        r.hi = ~0u;
+        full[k] = true;
+      }
+    }
+  }
+  return true;
 }
 
 static HashType draw_geometry_signature(GXVtxFmt fmt, const uint8_t* vertices,
@@ -2272,9 +2423,11 @@ static const CachedPipelineState& cached_pipeline_state(const PipelineConfig& co
   auto& entry = cache[hash & (CacheSize - 1)];
   if (entry.valid && entry.state.configHash == hash &&
       std::memcmp(&entry.config, &config, sizeof(config)) == 0) LIKELY {
+    g_statPipelineTableHits.fetch_add(1, std::memory_order_relaxed);
     return entry.state;
   }
 
+  g_statPipelineTableMisses.fetch_add(1, std::memory_order_relaxed);
   entry.valid = true;
   entry.config = config;
   entry.state = {
@@ -2292,6 +2445,7 @@ static const CachedPipelineState& cached_pipeline_state(const PipelineConfig& co
 enum class PipelineVariant : u8 { Game, CutoutSolid, CutoutFringe };
 static const CachedPipelineState& resolve_pipeline_state(GXPrimitive prim, GXVtxFmt fmt,
                                                          PipelineVariant variant = PipelineVariant::Game) {
+  StageTimer stageResolve(g_statStageResolveNanos, g_statStageResolveCalls);  // T2 (overlaps T1 by design)
   struct Memo {
     const CachedPipelineState* state = nullptr;
     u32 generation = 0;
@@ -2306,9 +2460,11 @@ static const CachedPipelineState& resolve_pipeline_state(GXPrimitive prim, GXVtx
   const u32 generation = g_gxState.pipelineStateGeneration;
   if (memo.state != nullptr && memo.generation == generation && memo.sampleCount == sampleCount &&
       memo.prim == prim && memo.fmt == fmt) LIKELY {
+    g_statMemoHits.fetch_add(1, std::memory_order_relaxed);
     return *memo.state;
   }
 
+  g_statMemoMisses.fetch_add(1, std::memory_order_relaxed);
   PipelineConfig config{};
   populate_pipeline_config(config, prim, fmt);
   if (variant == PipelineVariant::CutoutSolid) {
@@ -2548,6 +2704,7 @@ static float gx_bbox_comp(const u8* p, GXCompType t, u8 frac, bool be) {
 }
 static void gx_bbox_accumulate(GXVtxFmt fmt, const u8* verts, u32 count, u32 vtxSize, bool be) {
   if (!g_gxBBoxArmed || !verts || vtxSize == 0) return;
+  StageTimer stageBBox(g_statStageBBoxNanos, g_statStageBBoxCalls);  // T6: the armed walk only
   const auto& pf = g_gxState.vtxFmts[fmt].attrs[GX_VA_POS];
   const GXAttrType pd = g_gxState.vtxDesc[GX_VA_POS];
   if (pd == GX_NONE) return;
@@ -2558,6 +2715,8 @@ static void gx_bbox_accumulate(GXVtxFmt fmt, const u8* verts, u32 count, u32 vtx
   const auto& arr = g_gxState.arrays[GX_VA_POS];
   const auto& P = g_gxState.xfProjection;
   const auto& V = g_gxState.xfViewport;
+  g_statBBoxAccumCalls.fetch_add(1, std::memory_order_relaxed);
+  g_statBBoxArmedVerts.fetch_add(count, std::memory_order_relaxed);
   for (u32 i = 0; i < count; ++i) {
     const u8* v = verts + i * vtxSize;
     const u8* pp = v + pre;
@@ -2821,6 +2980,7 @@ static void gx_log_draw_extent(u8 prim, GXVtxFmt fmt, const u8* verts, u32 count
 }
 
 static bool admit_draw(GXPrimitive prim, GXVtxFmt fmt, u16 count, uint32_t vertexBytes, bool merged = false) {
+  StageTimer stageAdmit(g_statStageAdmitNanos, g_statStageAdmitCalls);  // T1
   const auto& indexTemplate = cached_index_template(prim, count);
   gfx::StagingSizes demand{vertexBytes, 0, indexTemplate.indices.size() * sizeof(u16), 0};
   if (merged) return gfx::staging_has_space(demand);
@@ -2960,7 +3120,8 @@ bool submit_raw_draw(GXPrimitive prim, GXVtxFmt fmt, const uint8_t* vertices, ui
                        interpolationIdentityActive || gfx::scene_stage::wanted()
                            ? draw_geometry_signature(fmt, vertices, vtxCount, vtxSize)
                            : 0,
-                       interpolationIdentityActive, direct_billboard_depths(prim, fmt, vertices, vertexBytes));
+                       interpolationIdentityActive, direct_billboard_depths(prim, fmt, vertices, vertexBytes),
+                       vertices, vtxSize, nullptr);
   g_rawFullscreenOverlay = false;
   return true;
 }
@@ -3101,6 +3262,11 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
 
   const auto particleDepths = direct_billboard_depths(prim, fmt, data + pos, totalVtxBytes);
   DrawData* mergeTarget = nullptr;
+  // usedrange: the ranges of the draw being considered for merging, computed once for the
+  // merge check and handed to handle_draw_unmerged when the draw ends up unmerged after all.
+  AttrIndexRange mergeRanges[kIndexAttrCount];
+  bool haveMergeRanges = false;
+  const u32 drawVtxSize = vtxCount != 0 ? totalVtxBytes / vtxCount : 0;
   // Debugging: NO100F_NO_MERGE turns draw merging off.
   static const int noMergeMode = [] {
     const char* v = std::getenv("NO100F_NO_MERGE");
@@ -3125,6 +3291,22 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
             vtxCount <= 65536u) LIKELY {
       mergeTarget = lastDraw;
     }
+  }
+  if (mergeTarget != nullptr && used_range_enabled()) {
+    // A merged draw fetches through the first draw's array uploads. It may only merge when
+    // every index it uses lies inside the slices those uploads cover: recorded on the arrays
+    // by handle_draw_unmerged, in this staging epoch, with the state undirtied since (a
+    // rebase, stride write or invalidation would have blocked the merge above).
+    haveMergeRanges = attr_index_ranges(fmt, data + pos, vtxCount, drawVtxSize, mergeRanges);
+    bool covered = haveMergeRanges;
+    for (int i = GX_VA_POS; covered && i <= GX_VA_TEX7; ++i) {
+      if (g_gxState.vtxDesc[i] != GX_INDEX8 && g_gxState.vtxDesc[i] != GX_INDEX16) continue;
+      const auto& array = g_gxState.arrays[i];
+      const AttrIndexRange& cand = mergeRanges[i - GX_VA_POS];
+      covered = array.uploadedValid && array.uploadedEpoch == gfx::staging_epoch() && cand.valid &&
+                cand.lo >= array.uploadedLo && cand.hi <= array.uploadedHi;
+    }
+    if (!covered) mergeTarget = nullptr;
   }
   if (MergeSuspectsOn()) {
     if (mergeTarget != nullptr && !g_mergeSuspects.empty()) {
@@ -3185,7 +3367,8 @@ static bool handle_draw(u8 cmd, const u8* data, u32& pos, u32 size, bool bigEndi
                        interpolationIdentityActive || gfx::scene_stage::wanted()
                            ? draw_geometry_signature(fmt, vertices, vtxCount, vtxSize)
                            : 0,
-                       interpolationIdentityActive, particleDepths);
+                       interpolationIdentityActive, particleDepths, vertices, drawVtxSize,
+                       haveMergeRanges ? mergeRanges : nullptr);
   if (fullScreenQuad) {
     g_gxState.proj = widenedProj;
     g_gxState.stateDirty = true;
@@ -3212,11 +3395,124 @@ bool skip_hor_plus_widen() noexcept {
 }
 }  // namespace aurora::gx
 namespace aurora::gx::fifo {
+// ---- storagecache (dk_diag key "storagecache" on the Switch, via NO100F_STORAGE_CACHE; default off) ----
+// Every unmerged draw uploads each indexed vertex array whole (see handle_draw_unmerged): ~1500
+// uploads and ~8 MB a frame in the Mystic Manor. With the cache on, an array whose host range
+// (pointer, size) was already uploaded in the current staging batch is reused from that upload,
+// as long as the guest-write generation over its bytes (gx_guest_write.h, through
+// aurora_set_guest_write_hooks) has not moved since.
+//
+// Why that is safe: the GX on console reads vertex arrays from RAM, so the game must make its CPU
+// writes visible with DCFlushRange/DCStoreRange (or write them by DMA/locked cache) before a draw
+// uses them; the runtime bumps the generation on exactly those (os_cache.cpp DC*Range, DCZeroRange,
+// LC*Blocks; DVD, card and ARAM DMA through GxNotifyGuestRamDmaWrite). A CPU-animated model rewritten
+// between two draws is flushed between them, so the second draw sees a new generation and uploads.
+// The generation is sampled before the bytes are copied, so a racing write only costs an upload.
+// What would make it unsafe: a write to the array that bumps no generation, i.e. stores through the
+// uncached alias (0xC.......) without a flush, a DMA path that skips GxNotifyGuestRamDmaWrite, or the
+// runtime/HLE writing guest RAM directly; arrays the runtime packs into host memory (stride > 255,
+// gx_dl.cpp) have no guest address, read as untracked, and always upload.
+// Reuse never crosses a staging batch (gfx::staging_epoch(): the offsets only mean something inside
+// the batch whose storage buffer holds them), so a hit is always within one frame's batch.
+namespace {
+struct StorageCacheEntry {
+  uint64_t generation = 0;
+  gfx::Range range{};
+};
+absl::flat_hash_map<std::pair<const void*, uint32_t>, StorageCacheEntry> s_storageCache;
+uint64_t s_storageCacheEpoch = ~0ull;
+std::atomic<uint64_t> s_storageCacheHits{0}, s_storageCacheMisses{0}, s_storageCacheSkippedBytes{0};
+std::atomic<uint64_t> s_usedRangeUploads{0}, s_usedRangeFallbacks{0}, s_usedRangeSavedBytes{0};
+
+bool storage_cache_enabled() noexcept {
+  static const bool on = [] {
+    const char* e = std::getenv("NO100F_STORAGE_CACHE");
+    return e != nullptr && e[0] != '0';
+  }();
+  return on;
+}
+
+gfx::Range storage_cached_upload(const void* data, uint32_t size) {
+  if (!storage_cache_enabled() || data == nullptr || size == 0) {
+    return gfx::push_storage(static_cast<const uint8_t*>(data), size);
+  }
+  const uint64_t epoch = gfx::staging_epoch();
+  if (epoch != s_storageCacheEpoch) {
+    s_storageCache.clear();
+    s_storageCacheEpoch = epoch;
+  }
+  const uint64_t generation = aurora::guest_write_generation(data, size);
+  if (generation == aurora::kGuestWriteUntracked) {
+    s_storageCacheMisses.fetch_add(1, std::memory_order_relaxed);
+    return gfx::push_storage(static_cast<const uint8_t*>(data), size);
+  }
+  const auto key = std::make_pair(data, size);
+  if (const auto it = s_storageCache.find(key); it != s_storageCache.end() && it->second.generation == generation) {
+    s_storageCacheHits.fetch_add(1, std::memory_order_relaxed);
+    s_storageCacheSkippedBytes.fetch_add(size, std::memory_order_relaxed);
+    return it->second.range;
+  }
+  s_storageCacheMisses.fetch_add(1, std::memory_order_relaxed);
+  const gfx::Range range = gfx::push_storage(static_cast<const uint8_t*>(data), size);
+  s_storageCache[key] = StorageCacheEntry{generation, range};
+  return range;
+}
+
+// usedrange: upload only the slice of `array` the draw's indices touch, and return the range to
+// stage as the shader's array base: the arena range pre-biased by lo*stride, so the shader's
+// array_start + index*stride lands on the same bytes as a whole-array upload. Any doubt falls
+// back to the whole upload. The uploaded slice is recorded on the array for the merge check.
+// The slice itself goes through storage_cached_upload, so with storagecache also on, an
+// unchanged slice is reused exactly like an unchanged whole array.
+static gfx::Range used_range_upload(AttrArray& array, const AttrIndexRange& range) {
+  auto whole = [&]() {
+    s_usedRangeFallbacks.fetch_add(1, std::memory_order_relaxed);
+    array.cachedRange = storage_cached_upload(array.data, array.size);
+    array.uploadedLo = 0;
+    array.uploadedHi = array.stride != 0 && array.size != 0 ? (array.size - 1) / array.stride : 0;
+    array.uploadedEpoch = gfx::staging_epoch();
+    array.uploadedValid = array.data != nullptr && array.stride != 0;
+    return array.cachedRange;
+  };
+  if (!range.valid || range.hi == ~0u || array.data == nullptr || array.size == 0 || array.stride == 0) {
+    return whole();
+  }
+  const uint64_t sliceBegin = static_cast<uint64_t>(range.lo) * array.stride;
+  const uint64_t sliceEnd = std::min<uint64_t>(array.size, static_cast<uint64_t>(range.hi + 1) * array.stride);
+  if (sliceBegin >= sliceEnd || sliceEnd - sliceBegin >= array.size) return whole();
+  const auto* sliceData = static_cast<const uint8_t*>(array.data) + sliceBegin;
+  const auto sliceSize = static_cast<uint32_t>(sliceEnd - sliceBegin);
+  gfx::Range uploaded = storage_cached_upload(sliceData, sliceSize);
+  array.cachedRange = uploaded;
+  array.uploadedEpoch = gfx::staging_epoch();
+  array.uploadedValid = true;
+  if (uploaded.offset < sliceBegin) {
+    // The biased base would wrap in u32. Re-upload from index 0 instead: still saves the
+    // unused tail, and the staged base stays the plain arena offset. Only reachable in the
+    // first uploads of a staging batch, where arena offsets are still small.
+    const auto fromZero = static_cast<uint32_t>(sliceEnd);
+    uploaded = storage_cached_upload(array.data, fromZero);
+    array.cachedRange = uploaded;
+    array.uploadedLo = 0;
+    array.uploadedHi = range.hi;
+    s_usedRangeUploads.fetch_add(1, std::memory_order_relaxed);
+    s_usedRangeSavedBytes.fetch_add(array.size - fromZero, std::memory_order_relaxed);
+    return uploaded;
+  }
+  array.uploadedLo = range.lo;
+  array.uploadedHi = range.hi;
+  s_usedRangeUploads.fetch_add(1, std::memory_order_relaxed);
+  s_usedRangeSavedBytes.fetch_add(array.size - sliceSize, std::memory_order_relaxed);
+  return gfx::Range{static_cast<uint32_t>(uploaded.offset - sliceBegin), uploaded.size};
+}
+}  // namespace
+
 static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
                                  gfx::Range vertRange, uint16_t usedPnMtxMask,
                                  HashType matrixTopologySignature,
                                  HashType geometrySignature, bool interpolationIdentityActive,
-                                 std::span<const float> particleDepths) {
+                                 std::span<const float> particleDepths, const uint8_t* vertices, u32 vtxSize,
+                                 const AttrIndexRange* attrRanges) {
   ZoneScoped;
   if (g_gxDrawLimit != ~0u && g_gxDrawIdx++ >= g_gxDrawLimit) return;
   // NO100F diagnostic (env NO100F_SKIP_DRAWS=a-b): skip draws a..b of every frame to bisect a bad draw (use NO100F_NO_MERGE=1).
@@ -3316,10 +3612,19 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
     g_gxState.pipelineStateGeneration = next_gx_state_epoch();
   }
   // Callers hold the renderer GPU mutex for the whole drain (process() and submit_raw_draw); taking it again per draw only cost a recursive re-entry.
+  StageTimer stageUploads(g_statStageUploadsNanos, g_statStageUploadsCalls);  // T3
   const auto& indexTemplate = cached_index_template(prim, vtxCount);
   const u32 numIndices = indexTemplate.indexCount;
   const gfx::Range idxRange = gfx::push_indices(ArrayRef<u16>{
       indexTemplate.indices.data(), indexTemplate.indices.size()});
+
+  // usedrange: the caller passes the draw's index ranges when it already walked the stream
+  // (the merge check); otherwise walk it here, once, before the upload loop.
+  AttrIndexRange localRanges[kIndexAttrCount];
+  if (used_range_enabled() && attrRanges == nullptr && vertices != nullptr &&
+      attr_index_ranges(fmt, vertices, vtxCount, vtxSize, localRanges)) {
+    attrRanges = localRanges;
+  }
 
   // Build pipeline, bind groups, and push draw command
   BindGroupRanges ranges{};
@@ -3331,10 +3636,23 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
     // arrays at the same address between draws (CPU-animated models), so reusing an earlier upload of the same
     // address drew models with another moment's vertices (spikes, stretched slabs). It is faster here, too.
     auto& array = g_gxState.arrays[i];
-    array.cachedRange = gfx::push_storage(static_cast<const uint8_t*>(array.data), array.size);
-    ranges.vaRanges[i - GX_VA_POS] = array.cachedRange;
+    if (used_range_enabled() && attrRanges != nullptr) {
+      ranges.vaRanges[i - GX_VA_POS] = used_range_upload(array, attrRanges[i - GX_VA_POS]);
+    } else {
+      array.cachedRange = storage_cached_upload(array.data, array.size);
+      ranges.vaRanges[i - GX_VA_POS] = array.cachedRange;
+      if (used_range_enabled()) {
+        // The walk failed for this draw: record the whole upload so a later merge check
+        // compares against what is actually in the arena, not an older draw's slice.
+        array.uploadedLo = 0;
+        array.uploadedHi = array.stride != 0 && array.size != 0 ? (array.size - 1) / array.stride : 0;
+        array.uploadedEpoch = gfx::staging_epoch();
+        array.uploadedValid = array.data != nullptr && array.stride != 0;
+      }
+    }
   }
 
+  stageUploads.stop();
   const CachedPipelineState* pipelineStatePtr = &resolve_pipeline_state(prim, fmt);
   resolve_sampled_textures(pipelineStatePtr->shaderInfo);
   // Only the resolved textures tell whether an HD replacement is drawn. The cut-out variants change the alpha test and
@@ -3357,6 +3675,8 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
   const auto& pipelineState = *pipelineStatePtr;
   const auto& info = pipelineState.shaderInfo;
 
+  // T5: bind-group build plus draw recording, to the end of this function.
+  StageTimer stageRecord(g_statStageRecordNanos, g_statStageRecordCalls);
   const auto bindGroups = build_bind_groups(info);
 
   const auto pipeline = pipelineState.ref;
@@ -3379,9 +3699,11 @@ static void handle_draw_unmerged(GXPrimitive prim, GXVtxFmt fmt, u16 vtxCount,
         .matrixTopology = matrixTopologySignature,
     };
   }
+  StageTimer stageUniform(g_statStageUniformNanos, g_statStageUniformCalls);  // T4
   const auto uniformRanges =
       build_uniform(info, vertRange.offset, ranges, drawIdentity, interpolationIdentityActive,
                     usedPnMtxMask);
+  stageUniform.stop();
   s_lastDrawRecordedInterpolation = interpolationIdentityActive;
 
   uint32_t instanceCount = 1;
@@ -3553,6 +3875,7 @@ bool handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian) {
       array.le = le;
       // Only drop the cached upload when the backing array actually changes.
       array.cachedRange = {};
+      array.uploadedValid = false;
       mark_pipeline_state_dirty();
     }
   } else if (subCmd == GX_LOAD_AURORA_TEXOBJ) {
@@ -3654,6 +3977,54 @@ extern "C" void AuroraTakeCopyStats(uint64_t* copies, uint64_t* creates) {
 
 extern "C" uint64_t AuroraGxProcessNanosTotal() {
   return aurora::gx::fifo::g_statProcessTotalNanos.load(std::memory_order_relaxed);
+}
+
+extern "C" uint64_t AuroraGxLockNanosTotal() {
+  return aurora::gx::fifo::g_statLockTotalNanos.load(std::memory_order_relaxed);
+}
+
+// storagecache counters since start (hits, misses, bytes not re-uploaded): the runtime's staging line.
+void aurora_storage_cache_totals(uint64_t* hits, uint64_t* misses, uint64_t* skippedBytes) {
+  *hits = aurora::gx::fifo::s_storageCacheHits.load(std::memory_order_relaxed);
+  *misses = aurora::gx::fifo::s_storageCacheMisses.load(std::memory_order_relaxed);
+  *skippedBytes = aurora::gx::fifo::s_storageCacheSkippedBytes.load(std::memory_order_relaxed);
+}
+
+// usedrange counters since start (subrange uploads, whole fallbacks, bytes not copied): the
+// runtime's staging line.
+void aurora_used_range_totals(uint64_t* uploads, uint64_t* fallbacks, uint64_t* savedBytes) {
+  *uploads = aurora::gx::fifo::s_usedRangeUploads.load(std::memory_order_relaxed);
+  *fallbacks = aurora::gx::fifo::s_usedRangeFallbacks.load(std::memory_order_relaxed);
+  *savedBytes = aurora::gx::fifo::s_usedRangeSavedBytes.load(std::memory_order_relaxed);
+}
+
+// bbox counters since start (armed vertices walked, accumulate calls, GXCopyDisp disarms of
+// still-armed windows): the runtime's staging line.
+void aurora_bbox_totals(uint64_t* armedVerts, uint64_t* accumCalls, uint64_t* disarms) {
+  *armedVerts = aurora::gx::fifo::g_statBBoxArmedVerts.load(std::memory_order_relaxed);
+  *accumCalls = aurora::gx::fifo::g_statBBoxAccumCalls.load(std::memory_order_relaxed);
+  *disarms = aurora::gx::fifo::g_statBBoxDisarms.load(std::memory_order_relaxed);
+}
+
+// pipeline memo counters since start: the runtime's staging line.
+void aurora_pipeline_memo_totals(uint64_t* bumps, uint64_t* memoHits, uint64_t* memoMisses,
+                                 uint64_t* tableHits, uint64_t* tableMisses) {
+  *bumps = aurora::gx::fifo::g_statPipelineBumps.load(std::memory_order_relaxed);
+  *memoHits = aurora::gx::fifo::g_statMemoHits.load(std::memory_order_relaxed);
+  *memoMisses = aurora::gx::fifo::g_statMemoMisses.load(std::memory_order_relaxed);
+  *tableHits = aurora::gx::fifo::g_statPipelineTableHits.load(std::memory_order_relaxed);
+  *tableMisses = aurora::gx::fifo::g_statPipelineTableMisses.load(std::memory_order_relaxed);
+}
+
+// Per-stage gx timer totals since start (NO100F_STAGE_TIMERS): the runtime's gxstage line.
+extern "C" void AuroraStageTimerTotals(uint64_t* admitNs, uint64_t* resolveNs, uint64_t* uploadNs,
+                                       uint64_t* uniformNs, uint64_t* recordNs, uint64_t* bboxNs) {
+  *admitNs = aurora::gx::fifo::g_statStageAdmitNanos.load(std::memory_order_relaxed);
+  *resolveNs = aurora::gx::fifo::g_statStageResolveNanos.load(std::memory_order_relaxed);
+  *uploadNs = aurora::gx::fifo::g_statStageUploadsNanos.load(std::memory_order_relaxed);
+  *uniformNs = aurora::gx::fifo::g_statStageUniformNanos.load(std::memory_order_relaxed);
+  *recordNs = aurora::gx::fifo::g_statStageRecordNanos.load(std::memory_order_relaxed);
+  *bboxNs = aurora::gx::fifo::g_statStageBBoxNanos.load(std::memory_order_relaxed);
 }
 
 extern "C" void AuroraTakeGxStats(uint64_t* processNanos, uint64_t* lockNanos, uint64_t* draws) {

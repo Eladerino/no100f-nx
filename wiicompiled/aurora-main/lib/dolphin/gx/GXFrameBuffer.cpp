@@ -14,6 +14,7 @@ extern "C" unsigned g_gxDrawIdx;
 #include "../../gfx/efb_ram_copy.hpp"
 #include "../../gfx/texture.hpp"
 #include "../../gx/fifo.hpp"
+#include "../../gx/command_processor.hpp"
 #include "../../internal.hpp"
 #include "../../window.hpp"
 #include "../../gfx/clear.hpp"
@@ -450,6 +451,7 @@ void GXCopyDisp(void* dest, GXBool clear) {
     if (g_gxDrawIdx != 0 && ++frames % 300 == 0) std::fprintf(stderr, "[drawcount] %u draws/frame\n", g_gxDrawIdx);
     g_gxDrawIdx = 0;
   }
+  if (g_gxBBoxArmed) aurora::gx::fifo::note_bbox_disarm();  // armed window discarded unread
   g_gxBBoxArmed = 0;  // a box cleared but never read this frame stops costing CPU projection
   (void)dest;
   // Finish queued commands before this copy reads live EFB state.

@@ -2128,7 +2128,13 @@ Range push_indices(const uint8_t* data, size_t length) { return push(g_indices, 
 Range push_uniform(const uint8_t* data, size_t length) {
   return push(g_uniforms, data, length, g_cachedLimits.minUniformBufferOffsetAlignment);
 }
+// push_storage calls and bytes since start (the vertex-array uploads of every unmerged GX draw,
+// command_processor.cpp handle_draw_unmerged): aurora_push_storage_totals hands them to the runtime's
+// per-600-frame line, to size the re-upload cost.
+static std::atomic<uint64_t> g_pushStorageCalls{0}, g_pushStorageBytes{0};
 Range push_storage(const uint8_t* data, size_t length) {
+  g_pushStorageCalls.fetch_add(1, std::memory_order_relaxed);
+  g_pushStorageBytes.fetch_add(length, std::memory_order_relaxed);
   return push(g_storage, data, length, g_cachedLimits.minStorageBufferOffsetAlignment);
 }
 Range push_texture_data(const uint8_t* data, size_t length, u32 bytesPerRow, u32 rowsPerImage) {
@@ -2229,3 +2235,7 @@ void aurora_pop_debug_group() {
 }
 
 const AuroraStats* aurora_get_stats() { return &aurora::gfx::g_stats; }
+void aurora_push_storage_totals(uint64_t* calls, uint64_t* bytes) {
+  *calls = aurora::gfx::g_pushStorageCalls.load(std::memory_order_relaxed);
+  *bytes = aurora::gfx::g_pushStorageBytes.load(std::memory_order_relaxed);
+}

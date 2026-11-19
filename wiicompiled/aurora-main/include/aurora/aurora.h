@@ -182,6 +182,14 @@ typedef void (*AuroraFrameWorkerWaitCallback)();
 void aurora_set_frame_worker_wait_callback(AuroraFrameWorkerWaitCallback callback);
 void aurora_wait_for_frame_worker();
 bool aurora_wait_for_frame_worker_for(uint32_t timeoutMicros);
+// Time the producer spent blocked on the frame worker since start, by phase (SEALED: the FIFO drain;
+// DONE: GXCopyDisp, end_frame, staging splits), and how many of those waits really blocked.
+void aurora_frame_worker_wait_totals(uint64_t* sealedNanos, uint64_t* doneNanos, uint64_t* sealedWaits,
+                                     uint64_t* doneWaits);
+// Whether the frame worker has no job in flight: both phases (SEALED and DONE) reached, so
+// no frame is between submission and present. Polled by the runtime's stall service as a
+// veto; lock-free atomic reads, safe from any thread.
+bool aurora_frame_worker_idle();
 // Absolute schedule for the next sealed frame, on steady_clock: baseNanos anchors the group and
 // intervalNanos is the period, so slot k of N+1 fires at base + k*interval/(N+1). Zeros clear it.
 void aurora_set_present_schedule(uint64_t baseNanos, uint64_t intervalNanos);

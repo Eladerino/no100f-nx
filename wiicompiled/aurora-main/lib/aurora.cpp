@@ -12,6 +12,9 @@
 #include "gx/shader_info.hpp"
 #include "imgui.hpp"
 #include "webgpu/gpu.hpp"
+#if defined(__SWITCH__) && defined(FW_SWITCH_DEKO)
+#include "deko/dk_aurora.h"
+#endif
 #include "webgpu/metalfx.hpp"
 #include <webgpu/webgpu_cpp.h>
 #endif
@@ -313,6 +316,9 @@ bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame);
 #endif
 
 void frame_worker_main() noexcept {
+#ifdef __SWITCH__
+  fw_switch_thread_mark(FW_THREAD_RENDER);  // switch/runtime/horizon_pthread.c (guestcore: core 1)
+#endif
   {
     std::lock_guard lock(g_frameWorker.mutex);
     g_frameWorker.threadId = std::this_thread::get_id();
@@ -385,10 +391,25 @@ bool frame_worker_phase_reached(FrameWorkerPhase phase) noexcept {
 
 bool wait_for_frame_worker_private_for(FrameWorkerPhase phase, std::chrono::microseconds timeout);
 
+// Time callers (the game thread: GXCopyDisp, the FIFO drain, end_frame, staging splits) spent blocked
+// on the frame worker, per phase, since start; aurora_frame_worker_wait_totals hands them out.
+std::atomic<uint64_t> g_frameWorkerWaitNanos[2]{};  // [0] SEALED, [1] DONE
+std::atomic<uint64_t> g_frameWorkerWaits[2]{};
+
 void wait_for_frame_worker_private(FrameWorkerPhase phase) {
   constexpr auto kWaitServiceInterval = std::chrono::milliseconds(1);
+  if (frame_worker_phase_reached(phase)) {
+    return;  // the common case: nothing to wait for, nothing to time
+  }
+  const auto started = std::chrono::steady_clock::now();
   while (!wait_for_frame_worker_private_for(phase, kWaitServiceInterval)) {
   }
+  const int slot = phase == FrameWorkerPhase::Sealed ? 0 : 1;
+  g_frameWorkerWaitNanos[slot].fetch_add(
+      static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()),
+      std::memory_order_relaxed);
+  g_frameWorkerWaits[slot].fetch_add(1, std::memory_order_relaxed);
 }
 
 bool wait_for_frame_worker_private_for(FrameWorkerPhase phase, std::chrono::microseconds timeout) {
@@ -1190,6 +1211,11 @@ bool present_presentation_job(const PresentationJob& job) {
     if (job.presentAt != PresentClock::time_point{}) {
       wait_until_precise(job.presentAt);
     }
+#if defined(__SWITCH__) && defined(FW_SWITCH_DEKO)
+    // H3: on Switch the picture goes to the deko3d interposer (switch/deko) instead of being
+    // dropped. It blocks until a swapchain image is free, which paces this branch to vsync.
+    aurora_switch_dk_present(job.image->texture.texture.Get());
+#endif
     record_successful_present(job.interpolated, job.logicalFrame, {}, {}, {}, {}, {},
                               std::chrono::duration_cast<std::chrono::nanoseconds>(PresentClock::now() -
                                                                                    submissionStarted),
@@ -1407,6 +1433,9 @@ PresenterState g_presenter;
 std::atomic<bool> g_presenterStarted{false};
 
 void presenter_main() noexcept {
+#ifdef __SWITCH__
+  fw_switch_thread_mark(FW_THREAD_RENDER);  // switch/runtime/horizon_pthread.c (guestcore: core 1)
+#endif
   if (!SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH)) {
     Log.warn("Could not raise the asynchronous presenter thread priority: {}", SDL_GetError());
   }
@@ -2360,6 +2389,17 @@ void aurora_set_frame_worker_wait_callback(AuroraFrameWorkerWaitCallback callbac
   aurora::g_frameWorkerWaitCallback.store(callback, std::memory_order_release);
 }
 void aurora_wait_for_frame_worker() { aurora::wait_for_frame_worker(); }
+void aurora_frame_worker_wait_totals(uint64_t* sealedNanos, uint64_t* doneNanos, uint64_t* sealedWaits,
+                                     uint64_t* doneWaits) {
+  *sealedNanos = aurora::g_frameWorkerWaitNanos[0].load(std::memory_order_relaxed);
+  *doneNanos = aurora::g_frameWorkerWaitNanos[1].load(std::memory_order_relaxed);
+  *sealedWaits = aurora::g_frameWorkerWaits[0].load(std::memory_order_relaxed);
+  *doneWaits = aurora::g_frameWorkerWaits[1].load(std::memory_order_relaxed);
+}
+bool aurora_frame_worker_idle() {
+  return aurora::frame_worker_phase_reached(aurora::FrameWorkerPhase::Sealed) &&
+         aurora::frame_worker_phase_reached(aurora::FrameWorkerPhase::Done);
+}
 bool aurora_wait_for_frame_worker_for(uint32_t timeoutMicros) {
   return aurora::wait_for_frame_worker_for(std::chrono::microseconds(timeoutMicros));
 }

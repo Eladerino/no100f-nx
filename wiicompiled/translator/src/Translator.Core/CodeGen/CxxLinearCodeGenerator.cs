@@ -100,7 +100,8 @@ public sealed partial class CxxLinearCodeGenerator
         bool gqrConstantsRequireRuntimeGuard = false,
         bool enableLeafAbiSpillElision = false,
         IReadOnlySet<uint>? modOverridableCallTargets = null,
-        bool enableGpuFifoBurstCoalescing = true)
+        bool enableGpuFifoBurstCoalescing = true,
+        bool enableSafepoints = false)
     {
         modOverridableCallTargets ??= new HashSet<uint>();
         nonReturningCallTargets ??= new HashSet<uint>();
@@ -148,6 +149,16 @@ public sealed partial class CxxLinearCodeGenerator
         // Flattened once per function: the emitter used to hash a (block, index)
         // tuple for every instruction of every emission of this body.
         var suppressedInstructionMasks = BuildSuppressedInstructionMasks(func, flagElision);
+        // Executor-safepoint checks are planned once against the final IR, like
+        // flag elision, so every emission of this body inserts the same checks.
+        // The plan is gated on enableSafepoints (set only by the capture
+        // variant's regeneration): with the gate off the plan is empty, no
+        // check is emitted anywhere, and emission matches the pre-safepoint
+        // generator exactly.
+        var safepointPlan = enableSafepoints
+            ? PlanSafepoints(
+                entryPoint, func, cfg, nonReturningCallTargets, lrContinuationCallTargets)
+            : SafepointPlan.Empty;
         var cxxName = SanitizeIdentifier(signature.Name);
         var pairedFlow = ComputePairedFlowStates(func, cfg, _guestAbiProvider);
         var pairedIn = pairedFlow.In;
@@ -421,6 +432,7 @@ public sealed partial class CxxLinearCodeGenerator
 
                         case IrJump jump:
                             EmitNormalizePairedStateOnEdge(body, "    ", block.Label, jump.TargetLabel, pairedOut, pairedIn, pairedEdgeLiveness.In);
+                            EmitSafepointCheckIfPlanned(body, "    ", safepointPlan, block.Label, jump.TargetLabel, nextBlockLabels);
                             EmitGotoUnlessFallthrough(body, "    ", block.Label, jump.TargetLabel, nextBlockLabels, labelNames, signature.Name);
                             break;
 
@@ -436,9 +448,11 @@ public sealed partial class CxxLinearCodeGenerator
                             // only when it actually carries something.
                             var falseEdge = new StringBuilder();
                             EmitNormalizePairedStateOnEdge(falseEdge, "        ", block.Label, br.FalseLabel, pairedOut, pairedIn, pairedEdgeLiveness.In);
+                            EmitSafepointCheckIfPlanned(falseEdge, "        ", safepointPlan, block.Label, br.FalseLabel, nextBlockLabels);
                             EmitGotoUnlessFallthrough(falseEdge, "        ", block.Label, br.FalseLabel, nextBlockLabels, labelNames, signature.Name);
                             body.AppendLine($"    if ({cond}) {{");
                             EmitNormalizePairedStateOnEdge(body, "        ", block.Label, br.TrueLabel, pairedOut, pairedIn, pairedEdgeLiveness.In);
+                            EmitSafepointCheckIfPlanned(body, "        ", safepointPlan, block.Label, br.TrueLabel, nextBlockLabels);
                             EmitGotoUnlessFallthrough(body, "        ", block.Label, br.TrueLabel, nextBlockLabels, labelNames, signature.Name);
                             if (falseEdge.Length != 0)
                             {
@@ -456,6 +470,7 @@ public sealed partial class CxxLinearCodeGenerator
                                 var caseLabel = RequireLabel(jt.TargetLabel, labelNames, block.Label, signature.Name);
                                 body.AppendLine($"    case 0x{jt.TargetAddress:X8}u:");
                                 EmitNormalizePairedStateOnEdge(body, "        ", block.Label, jt.TargetLabel, pairedOut, pairedIn, pairedEdgeLiveness.In);
+                                EmitSafepointCheckIfPlanned(body, "        ", safepointPlan, block.Label, jt.TargetLabel, nextBlockLabels: null);
                                 body.AppendLine($"        goto {caseLabel};");
                                 body.AppendLine("        break;");
                             }
@@ -475,6 +490,7 @@ public sealed partial class CxxLinearCodeGenerator
                             if (!string.IsNullOrWhiteSpace(succ))
                             {
                                 EmitNormalizePairedStateOnEdge(body, "    ", block.Label, succ!, pairedOut, pairedIn, pairedEdgeLiveness.In);
+                                EmitSafepointCheckIfPlanned(body, "    ", safepointPlan, block.Label, succ!, nextBlockLabels);
                                 EmitGotoUnlessFallthrough(body, "    ", block.Label, succ!, nextBlockLabels, labelNames, signature.Name);
                             }
                             else

@@ -64,6 +64,14 @@ public sealed partial class CxxLinearCodeGenerator
 
         public static readonly Regex ContextWord = new(@"\bctx\b", Options);
 
+        /// <summary>
+        /// One emitted executor-safepoint check line (see the Safepoint partial). The clone
+        /// rewriter deletes these from the state-free body: the serve call is ctx-shaped and
+        /// the clone has no ctx, so checks live only in the canonical CpuContext body.
+        /// </summary>
+        public static readonly Regex SafepointCheckLine = new(
+            @"(?m)^\s*if \(GuestSafepointRequested\(\)\) GuestSafepointServe\(ctx, 0x[0-9A-Fa-f]+u\);[ \t]*\r?\n?", Options);
+
         public static readonly Regex BoundaryDirectCall = new(
             @"(?m)^(?<pad>\s*)InvokeDirectCpu<0x(?<address>[0-9A-Fa-f]{8})u>\(ctx\);\s*$", Options);
 
@@ -605,6 +613,12 @@ public sealed partial class CxxLinearCodeGenerator
         var body = code[(openBrace + 1)..closeBrace];
         body = StateFreePatterns.DifferentialBlock.Replace(body, Environment.NewLine);
         body = RemoveStateFreeDirectCallFallbacks(body);
+
+        // Executor-safepoint checks belong to the CpuContext body only (the serve
+        // call names ctx, which this clone does not have). The canonical entry
+        // keeps its checks; entering through a clone is a stated coverage
+        // caveat of the safepoint design, not a silent gap.
+        body = StateFreePatterns.SafepointCheckLine.Replace(body, string.Empty);
 
         // One scan per shape instead of one rebuilt pattern per GQR. The
         // captured index text is compared literally, so a hypothetical

@@ -48,6 +48,17 @@ public sealed record TranslationOptions(
     IReadOnlyDictionary<uint, byte>? GqrCalleeWriteMasks = null,
     bool GqrConstantsRequireRuntimeGuard = false,
     bool EnableLeafAbiSpillElision = false,
+    /// <summary>
+    /// Executor-safepoint checks (Route A): when set, the code generator plans a
+    /// GuestSafepointServe check immediately before the backward goto of every
+    /// provably call-free cycle. Enabled only for the capture variant's
+    /// regeneration (the translate-recursive --safepoints flag): instrumented
+    /// capture builds need the checks to cross the load junction, but their
+    /// compiled presence in the shared generated tree freezes uninstrumented
+    /// builds at the boot junction, so default and pgo-use trees are generated
+    /// with this off.
+    /// </summary>
+    bool EnableSafepoints = false,
     IReadOnlySet<uint>? ModOverridableCallTargets = null,
     bool GenerateCxx = true,
     bool DiscoveryOnly = false,
@@ -746,7 +757,8 @@ public sealed class FunctionTranslator
             gqrCalleeWriteMasks: options.GqrCalleeWriteMasks,
             gqrConstantsRequireRuntimeGuard: options.GqrConstantsRequireRuntimeGuard,
             enableLeafAbiSpillElision: options.EnableLeafAbiSpillElision,
-            modOverridableCallTargets: options.ModOverridableCallTargets);
+            modOverridableCallTargets: options.ModOverridableCallTargets,
+            enableSafepoints: options.EnableSafepoints);
     }
 
     private static IrTracePpc CreateTrace(PpcInstruction instruction)

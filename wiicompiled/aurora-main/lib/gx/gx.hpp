@@ -284,6 +284,12 @@ struct AttrArray {
   u8 stride;
   bool le = true;
   gfx::Range cachedRange;
+  // usedrange: the index slice of this array the last unmerged draw uploaded, and the staging
+  // epoch it was uploaded in. Only meaningful when uploadedValid; the merge check reads it.
+  u32 uploadedLo = 0;
+  u32 uploadedHi = 0;
+  uint64_t uploadedEpoch = 0;
+  bool uploadedValid = false;
 };
 inline bool operator==(const AttrArray& lhs, const AttrArray& rhs) {
   return lhs.data == rhs.data && lhs.size == rhs.size && lhs.stride == rhs.stride && lhs.le == rhs.le;

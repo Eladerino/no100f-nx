@@ -288,7 +288,7 @@ int RunTranslateRecursive(string[] argsTail)
 {
     if (argsTail.Length == 0 || argsTail[0].StartsWith("--", StringComparison.Ordinal))
     {
-        Console.Error.WriteLine("Usage: translator translate-recursive <start_addr> [--outdir path] [--output-metadata path] [--threads N] [--prune-stale]");
+        Console.Error.WriteLine("Usage: translator translate-recursive <start_addr> [--outdir path] [--output-metadata path] [--threads N] [--prune-stale] [--safepoints]");
         return 1;
     }
 
@@ -316,6 +316,10 @@ int RunTranslateRecursive(string[] argsTail)
         }
     }
     var pruneStale = HasFlag(argsTail, "--prune-stale");
+    var enableSafepoints = HasFlag(argsTail, "--safepoints");
+    Console.WriteLine(enableSafepoints
+        ? "[translator] Safepoint checks ENABLED (--safepoints): capture-variant regeneration."
+        : "[translator] Safepoint checks disabled (no --safepoints): check-free regeneration.");
     var threadsOption = OptionValue(argsTail, "--threads");
     var maxThreads = threadsOption != null ? Math.Max(1, ParseInt(threadsOption)) : Math.Max(1, Environment.ProcessorCount);
     // Discovery batches: cheap front-end-only work items, so the batch is sized
@@ -1039,7 +1043,8 @@ int RunTranslateRecursive(string[] argsTail)
                         StateFreeCallSymbols: stateFreeCallSymbols,
                         StateFreeCallSiteVariants: stateFreeCallSiteVariantsByCaller.GetValueOrDefault(address),
                          StateFreeEntryVariants: stateFreeEntryVariantsByTarget.GetValueOrDefault(address),
-                         ModOverridableCallTargets: modOverridableCallTargets),
+                         ModOverridableCallTargets: modOverridableCallTargets,
+                         EnableSafepoints: enableSafepoints),
                     residentPolicy,
                     address);
             }
@@ -1463,6 +1468,7 @@ int RunTranslateRecursive(string[] argsTail)
     // Log end time and total duration
     var endTime2 = DateTime.Now;
     var totalDuration2 = endTime2 - startTime;
+    CxxLinearCodeGenerator.PrintSafepointCensus();
     Console.WriteLine($"[translator] Translation completed at {endTime2:HH:mm:ss}, total time: {totalDuration2.TotalSeconds:F2} seconds");
 
     return 0;
@@ -3381,7 +3387,8 @@ static (string? Positional, CommandOption[] Options)? CommandSpec(string command
         new("--production-source-bundle", "path"),
         new("--threads", "N"),
         new("--no-function-files"),
-        new("--prune-stale")
+        new("--prune-stale"),
+        new("--safepoints")
     }),
     "translate-mod" => (null, new CommandOption[]
     {

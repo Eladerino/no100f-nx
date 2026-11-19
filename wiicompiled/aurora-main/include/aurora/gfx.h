@@ -45,6 +45,18 @@ typedef struct {
 } AuroraPresentTiming;
 
 const AuroraStats* aurora_get_stats();
+// push_storage (the per-draw vertex-array uploads) calls and bytes since start.
+void aurora_push_storage_totals(uint64_t* calls, uint64_t* bytes);
+// storagecache (NO100F_STORAGE_CACHE) hits, misses and the bytes the hits did not re-upload, since start.
+void aurora_storage_cache_totals(uint64_t* hits, uint64_t* misses, uint64_t* skippedBytes);
+// usedrange (NO100F_USED_RANGE) subrange uploads, whole-array fallbacks and the bytes the
+// subrange uploads did not copy, since start.
+void aurora_used_range_totals(uint64_t* uploads, uint64_t* fallbacks, uint64_t* savedBytes);
+// bbox accumulate counters since start (armed vertices walked, accumulate calls, GXCopyDisp disarms).
+void aurora_bbox_totals(uint64_t* armedVerts, uint64_t* accumCalls, uint64_t* disarms);
+// pipeline memo counters since start (state bumps, memo hits/misses, config table hits/misses).
+void aurora_pipeline_memo_totals(uint64_t* bumps, uint64_t* memoHits, uint64_t* memoMisses,
+                                 uint64_t* tableHits, uint64_t* tableMisses);
 void aurora_get_present_timing(AuroraPresentTiming* timing);
 
 // Interpolation health: the per-frame fields describe the last sealed frame, the counters

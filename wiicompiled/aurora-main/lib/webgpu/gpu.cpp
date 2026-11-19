@@ -31,6 +31,10 @@ bool motion_vectors_active() noexcept;
 #include "../window.hpp"
 #include "../dolphin/vi/vi_internal.hpp"
 
+#if defined(__SWITCH__) && defined(FW_SWITCH_DEKO)
+#include "deko/dk_aurora.h"
+#endif
+
 #if defined(WEBGPU_DAWN) && !defined(__MINGW32__)
 #include "../dawn/BackendBinding.hpp"
 #include <dawn/native/DawnNative.h>
@@ -1088,6 +1092,11 @@ bool initialize(AuroraBackend auroraBackend) {
     });
   }
   g_queue = g_device.GetQueue();
+#if defined(__SWITCH__) && defined(FW_SWITCH_DEKO)
+  // H3: the deko3d interposer (switch/deko) creates its device, queue, swapchain and shader
+  // cache here, before Aurora creates any texture or buffer.
+  aurora_switch_dk_init();
+#endif
 
   auto surfaceFormat = wgpu::TextureFormat::RGBA8Unorm;
   auto presentMode = wgpu::PresentMode::Fifo;
@@ -1253,6 +1262,10 @@ void serialize_pipeline_caches() noexcept {
 }
 
 void shutdown() {
+#if defined(__SWITCH__) && defined(FW_SWITCH_DEKO)
+  // H3: waits for the GPU and gives the window back, before any wgpu object is released.
+  aurora_switch_dk_shutdown();
+#endif
   serialize_pipeline_caches();
   g_initialized.store(false, std::memory_order_release);
   g_CopyBindGroupLayout = {};

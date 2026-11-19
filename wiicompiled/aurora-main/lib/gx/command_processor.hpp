@@ -12,6 +12,10 @@ void reset_cp_register_cache();
 // list, so genMode copies Aurora recorded must not switch coplanar mode off.
 extern bool g_replayingDisplayList;
 
+// Count one GXCopyDisp disarm of a still-armed bounding box (60 fps campaign instruments,
+// PHASE1-DESK section 1.4): an armed window the frame end discarded unread.
+void note_bbox_disarm();
+
 // Process a buffer of GX FIFO commands
 uint32_t process(const uint8_t* data, uint32_t size, bool bigEndian);
 
