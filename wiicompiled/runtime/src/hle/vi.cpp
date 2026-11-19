@@ -558,7 +558,7 @@ void AdvanceRetrace(CpuContext* ctx, Clock::time_point retraceStamp, bool servic
     // Deterministic mode: this retrace starts a frame. Fingerprint guest memory as the previous
     // frame left it, then latch every channel's input for the new one before any guest code reads it.
     if (DetClock::Enabled()) {
-        DetHash::OnRetrace(retraceValue);
+        DetHash::OnRetrace(retraceValue, ctx ? ctx->gpr[1] : 0);
         FrameInput::Latch(retraceValue);
     }
 
