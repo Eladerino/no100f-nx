@@ -160,6 +160,11 @@ New automated game runs use them.
 **The level sweep** is `python tools/level-sweep.py` (`docs/testing.md`, section 4b): every level, up to 7 windows at once, on the same kit, with `fps60` on (`--fps30` for off).
 Run it before a release.
 
+**The determinism check** is `python tools/det-check.py` (`docs/testing.md`, section 4d): two runs on the virtual clock, with guest memory hashed every 30 retraces, compared frame by frame.
+Same build twice shows the game is deterministic; `--play-a`/`--play-b` compare two builds.
+Run it against a build of `main`, at 30 and 60 fps, for a change that should not change behaviour (a refactor of an override, a change behind an option that is off), and say so in the PR.
+It compares guest memory only: the picture and the sound are outside it.
+
 The PowerShell scripts that start the game (`manual-session`, `play-patched`, `capture-window`, `iterate`) take the same slots through `tools/debug/game-run.ps1`; there is no separate game-run lock any more.
 The controller isolation was tried once on a real pad (2026-11-07): a person pressed buttons and sticks for about 40 s of a full three-job run, and all three jobs passed with the same results as without.
 The game logs no controller connects, so the proof is those results, not a log line; repeat it when the isolation changes.

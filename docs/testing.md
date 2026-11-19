@@ -417,6 +417,29 @@ Exit codes: 0 clean, 1 something refused (it prints each file and why), 2 could 
 It cannot catch game data that was renamed and re-encoded, split small, or left in a type it does not list, nor a change that edits its own lists, so it is a safety net: the lists are in the script and the maintainers review changes to them.
 Its tests build throwaway repositories and run with the kit's: `python -m unittest discover -s tools/testkit -p "test_*.py"`.
 
+## 4d. Determinism check
+
+`python tools/det-check.py` (Python 3.8 or newer, Windows and Linux, standard library) runs the game twice on the virtual clock and compares guest memory frame by frame.
+Each run is the deterministic mode (`NO100F_DETERMINISTIC=1`, `wiicompiled/runtime/include/det_clock.h`): the time base, retraces, audio and alarms run on one virtual timeline, so the same build with the same input does the same thing every time, whatever the PC is doing.
+Every `--every` retraces (30) the game writes one line of hashes of its memory (`NO100F_DET_HASH`, `det_hash.h`); the script reports the first retrace where the two runs part.
+Same kit as the smoke test (own `Play\` copies, rumble off, muted, controller isolation, run slots); both runs go at once and take about 35 s for the default 1200 retraces.
+
+Two uses:
+- **Same build twice** (default): checks the game itself is deterministic, the base of the other use.
+- **Two builds** (`--play-a DIR --play-b DIR`, each a built `Play\` folder, or a copy of one): checks that a change which should not change behaviour doesn't, such as a refactor of an override or a change behind an option that is off.
+  Build the baseline from `main`, copy its `Play\` aside (the files at its top level and `button_icons\`), then build the change.
+  Run it once with `--fps30` and once without, so both frame rates are covered.
+
+Input is the scripted pad (`--input`, the `NO100F_INPUT_SCRIPT` format of section 7, with times in milliseconds of virtual time from boot); the default presses nothing.
+`--input-b` gives run b other input: a control, which must come out "different", to show the check can see a change at all.
+Each thread's stack below its stack pointer is left out of the hashes (`NO100F_DET_HASH_SKIP_DEAD_STACK=1`): two builds that behave the same still leave different leftovers there, for instance when a function moves between native and translated code. `--whole-memory` hashes it too.
+
+Options: `--boot` (`i004`), `--retraces`, `--every`, `--input`, `--input-b`, `--fps30`, `--whole-memory`, `--play-a`, `--play-b`, `--disc`, `--timeout`, `--slots`, `--keep`, `--skip-build-check`.
+Exit codes: 0 identical, 1 different, 2 wrong build, 3 not run (a run crashed or did not get far enough). Output: `autotest\det-<time>\` with `REPORT.md`, the two hash files and the runs' logs.
+It shows that memory matches, not that the picture or the sound does: Aurora and the audio mixer run outside guest memory.
+A difference names the retrace; `NO100F_DET_DUMP=<retrace>` writes both memory images there for a byte diff (`det_hash.h`).
+Measured on one PC (2026-11-18): `i004` with two A presses, same build twice, identical at 60 and 30 fps; a control with one extra press differed from the first hash after it.
+
 ## 5. Dev menu (F8)
 
 The dev menu is part of the game, off unless **Extras > Developer tools** is on in the launcher (`[game] dev_tools =
@@ -568,6 +591,7 @@ useful:
   no unrelated changes, no heuristics that hide a symptom.
 - Run what the change needs (the table in `.agents/REPO.md`, Testing): the unit tests it affects, and a full build if you touched overrides.
 - Asset check: `python tools/check-assets.py` (section 4c) must pass: no disc, game data, saves, logs or local files in the branch.
+- A change that should not change behaviour (a refactor, a change behind an option that is off): the determinism check against a build of `main`, at 30 and 60 fps (section 4d).
 - Smoke test: build first, then `python tools\smoke-test.py` (add `--scenes <scene,...>` for a level you changed; section 4a); before a release, the level sweep (section 4b). Keep it short; nothing runs it automatically (no CI), so the PR says what was run, and what it could not run.
 - Open it as a draft and say plainly what you tested and what you didn't.
 
