@@ -1,10 +1,10 @@
 # Shared by the debug kit's scripts (dot-source it: . "$PSScriptRoot\game-run.ps1", adjusting the path).
 #
-# Several checkouts (git worktrees, see worktree.ps1) can run side by side, each with its own Play\. These helpers keep
+# Several checkouts (git worktrees or clones) can run side by side, each with its own Play\. These helpers keep
 # a script to its own checkout, and make game runs share the machine through the test kit's run slots.
 #
 #   Get-CheckoutGames <root>    game processes started from inside <root> (its Play\, autotest\ copies, ...)
-#   Stop-CheckoutGames <root>   kills those, nothing else: other worktrees' games and the user's own game live on
+#   Stop-CheckoutGames <root>   kills those, nothing else: other checkouts' games and the user's own game live on
 #   Enter-GameSlot <root> <why> [-Shared] [-Persist]   waits for a run slot (tools/testkit/slots.py) and holds it for <root>
 #   Exit-GameSlot <root> [-Persisted]   gives it back: what this script run took; -Persisted also what an earlier script run took with -Persist
 #

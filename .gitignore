@@ -1,7 +1,7 @@
 # FrightWorks: Night of 100 Frights - only sources, project files and scripts are tracked.
 # Game data (the user's own disc) and everything built or downloaded stays out.
-# The folders a worktree links to the main checkout (tools/debug/worktree.py) have no trailing slash: a rule ending
-# in / matches only a real folder, and git sees a Linux symlink as a file, so the links would show as new files.
+# These folders have no trailing slash: a rule ending in / matches only a real folder, and a checkout may have them
+# as links (git sees a Linux symlink as a file), which would then show as new files.
 /Disc
 /game
 /toolchain
