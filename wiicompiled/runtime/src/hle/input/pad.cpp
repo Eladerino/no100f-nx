@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -286,6 +287,54 @@ extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
         statuses[0].err = PAD_ERR_NONE;
         statuses[0].button |= scripted;
         if (scripted) { static int n = 0; if (n++ < 5) RT_LOGF(RT_TAG_OS, "[pad] PADRead scripted buttons 0x%04X\n", scripted); }
+    }
+
+    // padwatch (SEAMFIX-FOLLOWUP-STUDY Q2, Nov 16, 2026): the seam proving boot's
+    // menu confirms never registered guest-side, and neither input path logs what
+    // the guest actually sees. When armed (dk_diag padwatch, SCOOBY_PADWATCH), log
+    // every change of the composed per-channel pad words - the exact state this
+    // function is about to write to guest memory, after every source (aurora
+    // PADRead, input bindings, dev menu, scripted) has merged - so one boot splits
+    // "the injection never reached the guest pad struct" from "the guest saw the
+    // button and its menu discarded it". Observation only: no state is touched,
+    // and with the env unset the block is inert. Capped at 20000 lines per boot.
+    static const bool padWatch = std::getenv("SCOOBY_PADWATCH") != nullptr;
+    if (padWatch) {
+        static const auto pwStart = std::chrono::steady_clock::now();
+        static uint32_t pwCalls = 0;
+        static uint32_t pwLines = 0;
+        static uint32_t pwLast[PAD_CHANMAX][3] = {};
+        static bool pwHave[PAD_CHANMAX] = {};
+        ++pwCalls;
+        const long long pwMs = static_cast<long long>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - pwStart).count());
+        for (uint32_t i = 0; i < PAD_CHANMAX; ++i) {
+            const PADStatus& st = statuses[i];
+            const uint32_t w0 = static_cast<uint32_t>(st.button) |
+                                (static_cast<uint32_t>(static_cast<uint8_t>(st.err)) << 16);
+            const uint32_t w1 = static_cast<uint32_t>(static_cast<uint8_t>(st.stickX)) |
+                                (static_cast<uint32_t>(static_cast<uint8_t>(st.stickY)) << 8) |
+                                (static_cast<uint32_t>(static_cast<uint8_t>(st.substickX)) << 16) |
+                                (static_cast<uint32_t>(static_cast<uint8_t>(st.substickY)) << 24);
+            const uint32_t w2 = static_cast<uint32_t>(st.triggerL) |
+                                (static_cast<uint32_t>(st.triggerR) << 8) |
+                                (static_cast<uint32_t>(st.analogA) << 16) |
+                                (static_cast<uint32_t>(st.analogB) << 24);
+            const bool pwChanged = !pwHave[i] || pwLast[i][0] != w0 || pwLast[i][1] != w1 || pwLast[i][2] != w2;
+            pwHave[i] = true;
+            pwLast[i][0] = w0; pwLast[i][1] = w1; pwLast[i][2] = w2;
+            if (pwChanged && pwLines < 20000) {
+                ++pwLines;
+                RT_LOGF(RT_TAG_OS,
+                        "[padwatch] n=%u t=%lldms chan=%u btn=0x%04X err=%d stick=%d,%d sub=%d,%d trig=%u,%u ana=%u,%u\n",
+                        pwCalls, pwMs, i, static_cast<unsigned>(st.button), static_cast<int>(st.err),
+                        static_cast<int>(st.stickX), static_cast<int>(st.stickY),
+                        static_cast<int>(st.substickX), static_cast<int>(st.substickY),
+                        static_cast<unsigned>(st.triggerL), static_cast<unsigned>(st.triggerR),
+                        static_cast<unsigned>(st.analogA), static_cast<unsigned>(st.analogB));
+            }
+        }
     }
 
     try {

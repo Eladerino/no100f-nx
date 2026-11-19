@@ -15,6 +15,16 @@
 #include <mutex>
 #include <vector>
 
+// EFB-to-texture copies (GXCopyTex) and display copies (GXCopyDisp) since start, for hle/vi.cpp's
+// frame lines. Game thread only.
+// Also the time settings_overlay::Draw takes there, every presented frame (open or not).
+static uint64_t g_gxTexCopies = 0, g_gxDispCopies = 0, g_overlayDrawNanos = 0;
+void GxCopyTotals(uint64_t* texCopies, uint64_t* dispCopies, uint64_t* overlayDrawNanos) {
+    *texCopies = g_gxTexCopies;
+    *dispCopies = g_gxDispCopies;
+    *overlayDrawNanos = g_overlayDrawNanos;
+}
+
 namespace {
 // Copy destinations stay GPU-only until an explicit/lazy readback. Track the
 // guest ranges that own those results so a later data-cache flush over a reused
@@ -126,6 +136,7 @@ extern "C" void GX__CopyDisp_8016fc38(uint32_t da, uint32_t c) {
     static const bool redClear = std::getenv("SCOOBY_RED_CLEAR") != nullptr;  // diagnostic: undrawn EFB shows red
     if (redClear) GXSetCopyClear(GXColor{255, 0, 0, 255}, 0x00FFFFFF);
     GXCopyDisp(GuestToHostPtr(da), (GXBool)c);
+    ++g_gxDispCopies;
     // No second GXDrawDone here: the frame-worker wait below is for the DONE
     // phase, which strictly subsumes the drain this call would perform.
     ++g_gxFrameCount;
@@ -134,7 +145,10 @@ extern "C" void GX__CopyDisp_8016fc38(uint32_t da, uint32_t c) {
     // (not the cheaper SEALED phase GXDrawDone waits for) because ImGui's draw lists, owned by
     // Aurora's render worker, replay during encode; aurora_end_frame would join here anyway.
     aurora_wait_for_frame_worker();
+    const auto overlayStart = std::chrono::steady_clock::now();
     settings_overlay::Draw();
+    g_overlayDrawNanos += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - overlayStart).count());
     // Seal, pace to the VI retrace boundary (Aurora renders the sealed frame
     // during the wait), and pre-warm the next frame.
     VI_HLE_PresentFrame(/*presentedXfb=*/true, /*paceToRetrace=*/true);
@@ -207,6 +221,7 @@ extern "C" void GX__CopyTex_8016fd74(uint32_t da, uint32_t c) {
         }
     }
     GXCopyTex(GuestToHostPtr(da), (GXBool)c);
+    ++g_gxTexCopies;
     // The extent the copy writes: a destination bigger than the source is a patch into a larger
     // texture (aurora sizes its copy the same way), not a claim on that whole texture's memory.
     const uint32_t copiedWidth = std::max<uint32_t>(rawSrcWidth >> (g_texCopyState.dstMipmap ? 1 : 0), 1);

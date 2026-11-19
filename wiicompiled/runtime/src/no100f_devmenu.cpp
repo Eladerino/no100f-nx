@@ -93,7 +93,9 @@ constexpr uint32_t kFakePortal = kReserveStart;
 constexpr uint32_t kFakePortalAsset = kReserveStart + 0x40u;
 
 const bool kReserved = [] {
+#if !defined(__SWITCH__)  // Switch: the Cheats page's level select needs the portal page too
     if (!RuntimeConfigFile::DevTools()) return false;
+#endif
     RecompMod::RegisterMemoryReservation(kReserveStart, kReserveStart + 0x1000u, "NO100F dev menu portal");
     return true;
 }();
@@ -2359,7 +2361,7 @@ void GalleryConditionalCallback(CpuContext* ctx) {
     const uint32_t target = static_cast<uint32_t>(ctx->gpr[4]);
     const uint32_t event = static_cast<uint32_t>(ctx->gpr[5]);
     GalleryRule rule = GalleryRule::Natural;
-    if (Enabled() && event == 0x3C) {
+    if (CheatsEnabled() && event == 0x3C) {
         ObserveGallery();
         const auto state = ProgressState();
         const bool active = g_galleryRules.Get(GallerySection::Pictures) != GalleryRule::Natural ||
@@ -2401,6 +2403,120 @@ void GalleryConditionalCallback(CpuContext* ctx) {
 bool Enabled() noexcept {
     static const bool enabled = RuntimeConfigFile::DevTools();
     return enabled;
+}
+
+bool CheatsEnabled() noexcept {
+#if defined(__SWITCH__)
+    return true;
+#else
+    return Enabled();
+#endif
+}
+
+// F10 > Cheats (Switch). The same edits as the dev menu's Player, Monsters, Levels and Warps tabs, in fewer words and
+// with buttons a controller can reach. Every edit is checked the same way (ProgressState, PlayerReason), so a press
+// at the wrong moment (title screen, loading, a cutscene) does nothing and says why in the status line.
+void DrawCheats() noexcept {
+    using namespace OverlayTheme;
+    if (!kReserved) {
+        Hint("Cheats are unavailable in this build.");
+        return;
+    }
+    const bool inGame = Read32Or0(kGameMode) == 0xB;
+    if (!inGame) Hint("Start or load a game first: most cheats only work in play.");
+
+    SectionTitle("Scooby");
+    bool god = g_god;
+    if (Toggle("Invincible (Scooby turns green)", &god)) SetGod(god);
+    PlayerStats snapshot;
+    bool readable = false;
+    const char* reason = PlayerReason(snapshot, &readable);
+    if (readable) ImGui::Text("Health %u / 5    Scooby Snacks %u", snapshot.health, snapshot.snacks);
+    ImGui::BeginDisabled(reason != nullptr);
+    if (ImGui::Button("Refill health")) {
+        g_status = ChangePlayerStat(PlayerStat::Health, 5);
+        ProgressLog("cheat health 5", g_status);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("+100 Scooby Snacks")) {
+        const uint32_t snacks = std::min<uint32_t>(snapshot.snacks + 100u, kDiagnosticSnackLimit);
+        g_status = ChangePlayerStat(PlayerStat::Snacks, snacks);
+        ProgressLog("cheat snacks +100", g_status);
+    }
+    ImGui::EndDisabled();
+    Hint("Snacks here are the ones you spend. They don't count towards a level's snack total or the galleries.");
+
+    SectionTitle("Gadgets");
+    if (ImGui::Button("Unlock all gadgets")) SetAllPowerups(true);
+    ImGui::SameLine();
+    if (ImGui::Button("Lock all gadgets")) SetAllPowerups(false);
+    for (const auto& power : kPowerupList) {
+        if (power.unused) continue;  // the unused ones stay on the dev menu
+        ImGui::PushID(power.key);
+        bool on = HasPowerup(power);
+        if (Toggle(power.label, &on)) SetPowerup(power, on);
+        ImGui::PopID();
+    }
+    Hint("Kept through level changes. Starting a new game or loading a save replaces them.");
+
+    SectionTitle("Monsters");
+    bool allOff = g_allMonstersOff;
+    if (Toggle("No monsters", &allOff)) SetAllMonstersOff(allOff);
+    Hint("Freezes every monster and moves it out of the level, in every level, until you turn this off.");
+
+    SectionTitle("Warp gates");
+    {
+        std::array<uint32_t, 26> flags{};
+        const bool warps = no100f_game_state::g_diagnosticLayoutVerified.load() && ReadWarps(ProgressRead, flags);
+        uint32_t found = 0;
+        for (uint32_t flag : flags) found += flag;
+        if (warps) ImGui::Text("Found %u of 26", found);
+        ImGui::BeginDisabled(!warps || found == flags.size() || ProgressState().Reason() != nullptr);
+        if (ImGui::Button("Unlock every warp gate")) {
+            uint32_t changed = 0;
+            for (size_t i = 0; i < flags.size(); ++i) {
+                if (flags[i] != 0) continue;
+                g_status = ChangeWarp(i, true);
+                ++changed;
+            }
+            ProgressLog("cheat warps", g_status);
+            g_status = "Unlocked " + std::to_string(changed) + " warp gates. Saving keeps them.";
+        }
+        ImGui::EndDisabled();
+    }
+
+    SectionTitle("Cutscene");
+    ImGui::BeginDisabled(!SkippableSequence());
+    if (ImGui::Button("Skip this cutscene")) RequestSkip();
+    ImGui::EndDisabled();
+
+    SectionTitle("Level select");
+    Hint("Takes Scooby to the start of that part of the level. Works in play, one trip at a time.");
+    if (g_sceneRequest.Active() || g_pendingSpot) {
+        ImGui::BeginDisabled(g_sceneRequest.Submitted());
+        if (ImGui::Button("Cancel the trip")) {
+            g_sceneRequest.Cancel();
+            g_pendingSpot = false;
+            g_status = "Trip cancelled.";
+        }
+        ImGui::EndDisabled();
+    }
+    LoadLevels();
+    const uint32_t cur = CurrentSceneId();
+    for (const Level& level : g_levels) {
+        if (!ImGui::TreeNode(level.title.c_str())) continue;
+        for (const Scene& scene : level.scenes) {
+            ImGui::PushID(static_cast<int>(scene.id));
+            if (ImGui::Selectable(scene.label.c_str(), scene.id == cur)) GoToScene(scene.id);
+            ImGui::PopID();
+        }
+        ImGui::TreePop();
+    }
+
+    if (!g_status.empty()) {
+        ImGui::Separator();
+        ImGui::TextWrapped("%s", g_status.c_str());
+    }
 }
 
 void HandleSdlEvent(const SDL_Event& event) noexcept {
@@ -2456,7 +2572,7 @@ void ApplyFreecam(uint32_t camera, CpuContext* ctx) {
 }
 
 void Draw() noexcept {
-    if (!Enabled() || !kReserved) return;
+    if (!CheatsEnabled() || !kReserved) return;
     ObserveGallery();
     if (InPlay() && CurrentSceneId() == kGalleryScene &&
         (g_galleryRules.Get(GallerySection::Pictures) != GalleryRule::Natural ||
@@ -2475,7 +2591,7 @@ void Draw() noexcept {
             ProgressLog("gallery invalidated", g_status);
         }
     }
-    UpdatePresses();
+    if (Enabled()) UpdatePresses();  // devmenu_press.txt: a file read every 30 frames, dev tools only
     const bool wasSkipping = g_skipRequest.Active();
     g_skipPressed = g_skipRequest.Press(SDL_GetTicks(), SameSkipSequence());
     if (wasSkipping && !g_skipRequest.Active())
@@ -2485,6 +2601,8 @@ void Draw() noexcept {
     ObservePlayerEdits();
     UpdateGod();
     UpdateMonsters();
+    // Switch without dev tools: only the cheats' upkeep above runs, no command files, texture logs or window.
+    if (!Enabled()) return;
     PollCommandFile();
     UpdateDrawn();
     UpdateTexLog();

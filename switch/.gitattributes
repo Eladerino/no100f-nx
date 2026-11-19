@@ -1,0 +1,5 @@
+# Scripts run in WSL and in the Linux build container, and the Dawn patches are applied there:
+# keep LF endings even on a Windows checkout with core.autocrlf.
+*.sh text eol=lf
+Containerfile text eol=lf
+*.patch -text

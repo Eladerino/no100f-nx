@@ -12,6 +12,11 @@ struct CpuContext;
 namespace no100f_devmenu {
 // [game] dev_tools, read once.
 bool Enabled() noexcept;
+// The game edits the F10 board's Cheats page uses (god mode, health, snacks, gadgets, monsters, level select, warp
+// gates): on Switch always (no keyboard there for F8, so they live on the board), elsewhere with Enabled().
+bool CheatsEnabled() noexcept;
+// The Cheats page's body, drawn by settings_overlay inside the F10 board (game thread). Switch only calls it.
+void DrawCheats() noexcept;
 void HandleSdlEvent(const SDL_Event& event) noexcept;
 // Called from settings_overlay::Draw (game thread, once per GXCopyDisp, inside the ImGui frame).
 void Draw() noexcept;

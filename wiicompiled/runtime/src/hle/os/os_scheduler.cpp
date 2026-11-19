@@ -1,7 +1,10 @@
 // SelectThread scheduler, OSWakeupThread and the OSMutex primitives.
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 
 #include "timebase_contract.h"
@@ -13,6 +16,91 @@
 #include "fiber_manager.h"
 #include "runtime_log.h"
 #include "os_internal.h"
+
+// Time the guest scheduler spent in its idle loop (no runnable guest thread) since start.
+static std::atomic<uint64_t> g_guestIdleNanos{0};
+
+// phasetime (PHASETIME design, Nov 19, 2026): wall time per guest thread, from SelectThread's
+// commit points. The running word has exactly two writers inside SelectThread (the idle entry
+// and the commit below); OSSleepThread's early-boot default-thread fallback and the fiber
+// exit cleanup can move it outside SelectThread, in which case the interval closes against
+// the last committed thread - rare, boot/exit only, noted not fixed. The open interval (last
+// commit -> now) is folded into snapshots at read time and never mutated there.
+// Up to 16 distinct threads are tracked; beyond that, further threads are dropped (the game
+// runs a handful; unreachable in practice).
+static bool PhaseTimeArmed() {
+    static const bool armed = std::getenv("SCOOBY_PHASETIME") != nullptr;
+    return armed;
+}
+struct PhaseThreadSlot {
+    uint32_t addr = 0;
+    uint64_t nanos = 0;
+};
+static PhaseThreadSlot s_phaseSlots[16];
+static int s_phaseSlotCount = 0;
+static uint32_t s_phaseCurrent = 0;
+static std::chrono::steady_clock::time_point s_phaseStamp{};
+static uint64_t s_phaseSwitches = 0;
+static void PhaseTimeAccrue(uint32_t thread, uint64_t nanos) {
+    for (int i = 0; i < s_phaseSlotCount; ++i) {
+        if (s_phaseSlots[i].addr == thread) {
+            s_phaseSlots[i].nanos += nanos;
+            return;
+        }
+    }
+    if (s_phaseSlotCount < 16) {
+        s_phaseSlots[s_phaseSlotCount].addr = thread;
+        s_phaseSlots[s_phaseSlotCount].nanos = nanos;
+        ++s_phaseSlotCount;
+    }
+    // Over the cap: the interval is dropped (documented above).
+}
+static void PhaseTimeCommit(uint32_t incoming) {
+    if (!PhaseTimeArmed()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (s_phaseCurrent != 0 && s_phaseStamp != std::chrono::steady_clock::time_point{}) {
+        PhaseTimeAccrue(s_phaseCurrent, static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - s_phaseStamp).count()));
+    }
+    if (incoming != s_phaseCurrent) ++s_phaseSwitches;
+    s_phaseCurrent = incoming;
+    s_phaseStamp = now;
+}
+uint32_t PhaseTimeThreadSnapshot(uint32_t* addrs, uint64_t* nanos, uint64_t* switchesOut) {
+    if (switchesOut) *switchesOut = s_phaseSwitches;
+    if (!PhaseTimeArmed()) return 0;
+    int n = s_phaseSlotCount;
+    for (int i = 0; i < n; ++i) {
+        addrs[i] = s_phaseSlots[i].addr;
+        nanos[i] = s_phaseSlots[i].nanos;
+    }
+    // Fold the open interval into the current thread's entry (snapshot only; no state mutated).
+    // The current thread may have no slot yet (slots are created at the NEXT commit), so it is
+    // appended when missing.
+    if (s_phaseCurrent != 0 && s_phaseStamp != std::chrono::steady_clock::time_point{}) {
+        const uint64_t open = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - s_phaseStamp).count());
+        int idx = -1;
+        for (int i = 0; i < n; ++i) {
+            if (addrs[i] == s_phaseCurrent) { idx = i; break; }
+        }
+        if (idx >= 0) {
+            nanos[idx] += open;
+        } else if (n < 16) {
+            addrs[n] = s_phaseCurrent;
+            nanos[n] = open;
+            ++n;
+        }
+    }
+    return static_cast<uint32_t>(n);
+}
+static void NoteGuestIdle(std::chrono::steady_clock::duration d)
+{
+    g_guestIdleNanos.fetch_add(
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(d).count()),
+        std::memory_order_relaxed);
+}
+uint64_t GuestSchedulerIdleNanosTotal() { return g_guestIdleNanos.load(std::memory_order_relaxed); }
 
 namespace {
 void LinkMutexToThread(uint32_t threadPtr, uint32_t mutexPtr)
@@ -93,6 +181,64 @@ void PromoteThreadPriority(uint32_t threadPtr, int32_t priority)
 }
 } // namespace
 
+
+// tracewake (park seam trace, Nov 16, 2026; PARK-STUDY.md Q4(d)): shared seam state
+// for the [wake] loggers in this file and os_sleep.cpp (declared in hle_stubs.h).
+// The snapshot reads guest memory host-side only - TryReadGuestScalar never faults
+// the host - and the armed check reads SCOOBY_TRACE_WAKE once. With the env unset
+// nothing is captured or logged and no behaviour changes.
+bool OS_HLE_TraceWakeArmed()
+{
+    static const bool armed = std::getenv("SCOOBY_TRACE_WAKE") != nullptr;
+    return armed;
+}
+
+// seamfix (SEAMFIX-DESIGN.md): arm flag for the OSSleepThread seam pass and the
+// GX PE-interrupt class deferral. Read once, like the tracewake arm above.
+bool OS_HLE_SeamFixArmed()
+{
+    static const bool armed = std::getenv("SCOOBY_SEAMFIX") != nullptr;
+    return armed;
+}
+
+// Fix 2 (FIX2-DESIGN-STUDY Part B): arm flag for the present-time completion
+// synthesis hook in hle/vi.cpp. A separate key from seamfix so the seamfix
+// A/B (the CLIFF-STUDY decider boot) stays uncontaminated and the two
+// mechanisms remain separately falsifiable. Read once, like the arms above.
+bool OS_HLE_Fix2Armed()
+{
+    static const bool armed = std::getenv("SCOOBY_FIX2") != nullptr;
+    return armed;
+}
+
+TraceWakeSync OS_HLE_TraceWakeReadSync()
+{
+    TraceWakeSync s;
+    MemoryInline::TryReadGuestScalar(0x802716C0u, s.counterA);
+    MemoryInline::TryReadGuestScalar(0x802716C4u, s.counterB);
+    MemoryInline::TryReadGuestScalar(0x802716D8u, s.arm);
+    MemoryInline::TryReadGuestScalar(0x802716DCu, s.latch);
+    MemoryInline::TryReadGuestScalar(0x80271398u, s.guest);
+    MemoryInline::TryReadGuestScalar(0x802716D4u, s.d4);
+    MemoryInline::TryReadGuestScalar(0x802716B8u, s.b8);
+    MemoryInline::TryReadGuestScalar(0x802716E0u, s.e0);
+    MemoryInline::TryReadGuestScalar(0x802716D0u, s.flag);
+    return s;
+}
+
+
+// parkwatch (park rescue, Nov 16, 2026; PARK-STUDY-2.md Q4(c)): one-shot wake
+// request for the display-sync queue. The detector in hle/vi.cpp sets it when
+// the park signature confirms; SelectThread's idle loop below consumes it and
+// fires the wake there, on the scheduler thread - where every other wake in
+// the system already happens - and never on the service thread. The wake is a
+// bare queue drain (WakeupThreadQueue): it runs no guest code.
+void OS_HLE_WakeupThreadNoReschedule(CpuContext* ctx, uint32_t waitQueue);
+static std::atomic<bool> g_parkWakeRequest{false};
+void OS_HLE_RequestParkWake()
+{
+    g_parkWakeRequest.store(true, std::memory_order_release);
+}
 extern "C" void OSWakeupThread_HLE_801aaaa4(CpuContext* ctx);
 extern "C" void OSSleepThread_HLE_801aa9b8(CpuContext* ctx);
 
@@ -108,6 +254,12 @@ static void DeterministicIdleStep(CpuContext* cpu)
     }
     VI_HLE_PollRetrace(cpu);
     ProcessAlarmQueue(cpu, 8);
+    // seamfix: the held GX PE-interrupt class is part of this pump's delivery
+    // set too, so deterministic mode can never starve it (the seam pass
+    // itself stays DetClock-gated off; order stays fixed: general, then GX).
+    if (OS_HLE_SeamFixArmed()) {
+        DvdProcessPendingGxCallbacks(cpu);
+    }
     if (::Memory::Read32(kSchedulerPendingFlagAddr) != 0) {
         return;
     }
@@ -252,11 +404,19 @@ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
     if (reschedPending == 0) {
         // No threads to run - enter idle loop
         TryInvokeSwitchCallback(runningContext, 0, cpu);
+        PhaseTimeCommit(0);
         ::Memory::Write32(kOSRunningContextAddr, 0);
         
         // Set current context to idle thread context
         OS__SetCurrentContext_801a1e70(kIdleThreadContextAddr);
-        
+        // Idle time (no guest thread runnable: VIWaitForRetrace sleepers, audio/alarm waits), so the
+        // frame lines in hle/vi.cpp can split the guest's time into work and waiting.
+        const auto idleStart = std::chrono::steady_clock::now();
+        struct IdleTimer {
+            std::chrono::steady_clock::time_point start;
+            ~IdleTimer() { NoteGuestIdle(std::chrono::steady_clock::now() - start); }
+        } idleTimer{idleStart};
+
         while (true) {
             // Enable interrupts and idle until something becomes runnable.
             OS__EnableInterrupts_801a65c0();
@@ -275,11 +435,26 @@ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
                 if (::Memory::Read32(kSchedulerPendingFlagAddr) != 0) {
                     break;
                 }
+                // parkwatch actuation (PARK-STUDY-2.md Q4(c)): the detector
+                // in hle/vi.cpp confirmed the display-sync park signature and
+                // set the request flag; fire exactly one no-reschedule wake
+                // on that queue, here on the scheduler thread.
+                if (g_parkWakeRequest.exchange(false, std::memory_order_acq_rel)) {
+                    static uint32_t parkFireCount = 0;
+                    RT_LOGF(RT_TAG_OS, "[parkwatch] fire #%u (idle-loop actuation, queue 0x802716E4)\n",
+                            ++parkFireCount);
+                    OS_HLE_WakeupThreadNoReschedule(cpu, kTraceWakeQueueAddr);
+                }
                 VI_HLE_PollRetrace(cpu);
                 if (Fiber::GuestFiberManager::IsInitialized()) {
                     Fiber::GuestFiberManager::ProcessTimerEvents(cpu);
                 }
                 ProcessAlarmQueue(cpu, 8);
+                // seamfix: held GX PE-interrupt class, delivered at the
+                // idle pump (an interrupt-shaped point) when armed.
+                if (OS_HLE_SeamFixArmed()) {
+                    DvdProcessPendingGxCallbacks(cpu);
+                }
                 if (::Memory::Read32(kSchedulerPendingFlagAddr) != 0) {
                     break;
                 }
@@ -366,6 +541,7 @@ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
     TryInvokeSwitchCallback(runningContext, nextThread, cpu);
 
     // Update running context
+    PhaseTimeCommit(nextThread);
     ::Memory::Write32(kOSRunningContextAddr, nextThread);
     
     // Set as current context
@@ -432,6 +608,17 @@ static void WakeupThreadQueue(CpuContext* ctx, bool allowImmediateReschedule)
     constexpr int kMaxWake = 256;
     int woke = 0;
 
+    // tracewake: for the display-sync queue only, capture the head and the sync
+    // snapshot at entry so the exit line below can flag a wake that found no
+    // waiter. Reads only - the wake itself is unchanged.
+    const bool traceThis = OS_HLE_TraceWakeArmed() && queueAddr == kTraceWakeQueueAddr;
+    uint32_t headAtEntry = 0;
+    TraceWakeSync snapAtEntry{};
+    if (traceThis) {
+        MemoryInline::TryReadGuestScalar(queueAddr, headAtEntry);
+        snapAtEntry = OS_HLE_TraceWakeReadSync();
+    }
+
     while (woke < kMaxWake) {
         const uint32_t thread = ::Memory::Read32(queueAddr);
         if (thread == 0) {
@@ -476,6 +663,26 @@ static void WakeupThreadQueue(CpuContext* ctx, bool allowImmediateReschedule)
     if (woke >= kMaxWake) {
         RT_LOG(RT_TAG_OS) << "OSWakeupThread: hit safety limit, possible queue cycle at 0x"
                   << std::hex << queueAddr << std::dec << std::endl;
+    }
+
+    // tracewake: one line per wake on the display-sync queue. head is the queue
+    // head captured at entry; head == 0 means the wake found no waiter and was
+    // discarded - the lost-wakeup shape - flagged literally as wake-to-empty.
+    // inrestore marks a wake executed inside DeliverPendingInterruptsOnEnable
+    // (the waiter's own OSRestoreInterrupts delivery), read through
+    // OS_HLE_InRestoreDelivery(). The snapshot is the entry snapshot: counter A
+    // already holds the value the advancer advanced it to before calling here.
+    if (traceThis) {
+        static int wakeN = 0;
+        if (wakeN++ < 100000) {
+            RT_LOGF(RT_TAG_OS,
+                    "[wake] wakeup q=0x%08X head=0x%08X woke=%d result=%s lr=0x%08X inrestore=%d A=%u B=%u arm=%u latch=%u guest=%u d4=%u b8=%u e0=%u flag=%u\n",
+                    queueAddr, headAtEntry, woke, headAtEntry == 0 ? "wake-to-empty" : "woke",
+                    cpu->lr, OS_HLE_InRestoreDelivery() ? 1 : 0,
+                    snapAtEntry.counterA, snapAtEntry.counterB, snapAtEntry.arm,
+                    snapAtEntry.latch, snapAtEntry.guest,
+                    snapAtEntry.d4, snapAtEntry.b8, snapAtEntry.e0, snapAtEntry.flag);
+        }
     }
 
     if (allowImmediateReschedule && resched && !VI_HLE_IsAdvancingRetrace()) {

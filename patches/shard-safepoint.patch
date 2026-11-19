@@ -1,0 +1,33 @@
+--- a/wiicompiled/generated/build_shards/base_common/shard_9e6d0891680e24b492f4994a.cpp
++++ b/wiicompiled/generated/build_shards/base_common/shard_9e6d0891680e24b492f4994a.cpp
+@@ -10101,6 +10101,14 @@
+ #include "memory.h"
+ #include "recomp_mod_loader.h"
+ 
++// safepoint (SAFEPOINT-DESIGN Route B): executor-safepoint checks
++// hand-emitted at this function's two call-free back-edges below; the
++// helpers live in runtime hle/vi.cpp and serve only while the safepoint
++// gate's request stands (dk_diag safepoint). HAND LINES IN A GENERATED
++// FILE - the reapplication record is safepoint-backup/
++// shard-safepoint.patch; a regeneration drops them.
++extern "C" bool GuestSafepointRequested();
++extern "C" void GuestSafepointServe(CpuContext* ctx, uint32_t backEdgeTarget);
+ extern "C" void func_800D8164(CpuContext* RECOMP_RESTRICT ctx)
+ {
+     uint32_t cr0_0 = 0;
+@@ -11230,6 +11238,7 @@
+ loc_800D85A4:
+ {
+     if ((static_cast<uint32_t>(r0) != static_cast<uint32_t>(0))) {
++        if (GuestSafepointRequested()) GuestSafepointServe(ctx, 0x800D859Cu);
+         goto loc_800D859C;
+     }
+ }
+@@ -11259,6 +11268,7 @@
+ loc_800D85BC:
+ {
+     if (((cr & 0x20000000u) == 0)) {
++        if (GuestSafepointRequested()) GuestSafepointServe(ctx, 0x800D85B4u);
+         goto loc_800D85B4;
+     }
+ }

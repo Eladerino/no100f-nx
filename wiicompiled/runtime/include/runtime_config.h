@@ -205,6 +205,9 @@ inline bool IsSupportedGraphicsApi(std::string_view value) {
     static constexpr std::array<std::string_view, 2> values{"auto", "vulkan"};
 #elif defined(_WIN32)
     static constexpr std::array<std::string_view, 3> values{"auto", "d3d12", "vulkan"};
+#elif defined(__SWITCH__)
+    // deko3d is the only renderer and is chosen by the build, not by config.
+    static constexpr std::array<std::string_view, 1> values{"auto"};
 #endif
     return std::find(values.begin(), values.end(), value) != values.end();
 }
@@ -247,7 +250,7 @@ inline std::optional<std::filesystem::path> ExecutableDirectory() {
         }
         buffer.resize(buffer.size() * 2);
     }
-#elif defined(__APPLE__) || defined(__ANDROID__)
+#elif defined(__APPLE__) || defined(__ANDROID__) || defined(__SWITCH__)
     return RuntimePlatform::ExecutableDirectory();
 #else
     // /proc/self/exe is a Linux-specific magic symlink to the running executable; readlink()
@@ -324,7 +327,7 @@ inline std::filesystem::path ApplicationDataDirectory() {
     if (localAppData) {
         return *localAppData / kInstalledDataDirectoryName;
     }
-#elif defined(__APPLE__) || defined(__ANDROID__)
+#elif defined(__APPLE__) || defined(__ANDROID__) || defined(__SWITCH__)
     return RuntimePlatform::ApplicationDataDirectory(kApplicationDirectoryName);
 #else
     // XDG Base Directory spec equivalent of FOLDERID_LocalAppData: $XDG_DATA_HOME if set and
@@ -365,7 +368,13 @@ inline void EnsureConfigFile() {
               "widescreen = true\n"
               "force_16_9 = false\n"
               "# render height = 480 x resolution_multiplier: 1.5 = 720p, 2.25 = 1080p, 4.5 = 4K, 0 = screen size\n"
+#if defined(__SWITCH__)
+              // Switch: 720p internal. At 2.25 the console's GPU alone takes ~42 ms a frame in the
+              // Mystic Manor (deko3d timestamps, Nov 14 2026), above the 33 ms of 30 fps.
+              "resolution_multiplier = 1.5\n"
+#else
               "resolution_multiplier = 2.25\n"
+#endif
               "# 0 (off), 120 or 180; only with fps60 = true, it stays off at 30 fps\n"
               "frame_interpolation_fps = 0\n"
               "# true = 60 fps (the game times itself by the clock, so it keeps its speed)\n"
@@ -1379,7 +1388,15 @@ inline std::string DvdRoot(std::string fallback = "") {
 inline std::filesystem::path ResolveRelativeTo(const std::filesystem::path& base,
                                                const std::string& value) {
     std::filesystem::path path = PathFromUtf8(value);
+#if defined(__SWITCH__)
+    // Horizon paths can start with a device ("sdmc:/..."), which std::filesystem calls relative.
+    const std::string generic = path.generic_string();
+    const size_t colon = generic.find(':');
+    const bool hasDevice = colon != std::string::npos && colon > 0 && generic.find('/') == colon + 1;
+    if (path.is_relative() && !hasDevice) {
+#else
     if (path.is_relative()) {
+#endif
         path = base / path;
     }
     return path.lexically_normal();
@@ -1412,7 +1429,7 @@ inline std::filesystem::path SavesDirectory() {
     return ApplicationDataDirectory() / "Saves";
 }
 
-#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__ANDROID__)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__ANDROID__) && !defined(__SWITCH__)
 // The XDG user folder (Pictures, Videos) of the person running the game: the line XDG_<NAME>_DIR="$HOME/..." in
 // $XDG_CONFIG_HOME/user-dirs.dirs (xdg-user-dirs), else $HOME/<fallback>; empty when there is no home folder either.
 // Environment.SpecialFolder.MyPictures / MyVideos in launcher/DataPaths.cs finds the same folders.
@@ -1468,7 +1485,7 @@ inline std::filesystem::path CaptureDirectory(bool videos) {
             return *folder / kInstalledUserFolderName;
         }
     }
-#elif !defined(__APPLE__) && !defined(__ANDROID__)
+#elif !defined(__APPLE__) && !defined(__ANDROID__) && !defined(__SWITCH__)
     if (!PortableRootDirectory()) {
         const auto folder = videos ? XdgUserDirectory("VIDEOS", "Videos") : XdgUserDirectory("PICTURES", "Pictures");
         if (!folder.empty()) {

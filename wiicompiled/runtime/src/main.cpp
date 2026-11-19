@@ -98,6 +98,15 @@ extern "C" int g_gxFrameCount;
 extern "C" const char* DVDResolveHostPathForTest(const char* dvdPath);
 bool OS_HLE_InterruptsEnabled() noexcept;
 
+#if defined(__SWITCH__)
+// switch/source/fw_switch_init.cpp: the host stack, as offsets into the NRO's ELF.
+extern "C" size_t fw_switch_host_backtrace(char* out, size_t size, unsigned skip);
+// switch/source/fw_debug_server.cpp: performs a debug-server boot requested by
+// userAppInit (which runs before the static constructors, so it cannot boot the
+// server itself). No-op when no boot was requested.
+extern "C" void fw_debug_server_boot_pending(void);
+#endif
+
 namespace {
 
 // Defined below, beside the fatal-log machinery.
@@ -707,6 +716,10 @@ std::string FormatHostStackTrace(unsigned framesToSkip) {
         out << ")\n";
     }
     return out.str();
+#elif defined(__SWITCH__)
+    std::string trace(4096, '\0');
+    trace.resize(fw_switch_host_backtrace(trace.data(), trace.size(), framesToSkip + 1));
+    return trace;
 #else
     (void)framesToSkip;
     return {};
@@ -785,6 +798,10 @@ void DumpHostStackTrace() {
     std::fputs(trace.c_str(), stderr);
     std::fflush(stderr);
     s_inProgress.clear();
+#elif defined(__SWITCH__)
+    const std::string trace = FormatHostStackTrace(1);
+    std::fputs(trace.c_str(), stderr);
+    std::fflush(stderr);
 #else
     RT_LOGF(RT_TAG_RUNTIME, "Host stack trace unavailable on this platform\n");
     std::fflush(stderr);
@@ -1160,7 +1177,8 @@ void InstallSehLogger() {
         SetUnhandledExceptionFilter(UnhandledSehFilter);
     }
 }
-#else
+#elif !defined(__SWITCH__)
+// Horizon has no signals: faults go to libnx's exception handler (switch/source in spm-nx).
 // POSIX counterpart to SehLogger above. Unlike Windows' AddVectoredExceptionHandler, which lets
 // GuestFlat and this module each install their own handler and defensively re-check each other,
 // sigaction only allows one handler per signal - the second registration replaces the first
@@ -1377,10 +1395,17 @@ int RuntimeMain(int argc, char** argv) {
     ConfigureWindowsFatalDialogBehavior();
     InstallSehLogger();
     WindowsTimerResolutionGuard timerResolutionGuard;
-#else
+#elif !defined(__SWITCH__)
     InstallPosixMemoryFaultHandler();
 #endif
     InitializeProcessTranscript(argc, argv);
+#if defined(__SWITCH__)
+    // The debug server (dev builds): userAppInit only requested this boot,
+    // because it runs before the static constructors and the server's C++
+    // globals do not exist there (no100f-nx crash-2). Main is running now, so
+    // they do. No-op when no boot was requested (server off, sockets off).
+    fw_debug_server_boot_pending();
+#endif
     std::signal(SIGABRT, AbortSignalHandler);
     // Install exit/terminate handlers to ensure we get crash info
     std::atexit(AtExitHandler);
@@ -1497,7 +1522,12 @@ int RuntimeMain(int argc, char** argv) {
             RuntimeConfigFile::ForceAspect169Enabled()      ? DisplaySettings::kAspect16x9
             : !RuntimeConfigFile::WidescreenEnabled(true) ? DisplaySettings::kAspect4x3
                                                           : DisplaySettings::kAspectFill);
+#if defined(__SWITCH__)
+        // Switch: 720p internal by default (runtime_config.h writes the same into a fresh Config.toml).
+        displaySettings.renderScale = RuntimeConfigFile::ResolutionMultiplier(1.5f);
+#else
         displaySettings.renderScale = RuntimeConfigFile::ResolutionMultiplier(2.25f);  // 1080p
+#endif
         DisplaySettings::Initialize(displaySettings);
         const bool configWidescreen = DisplaySettings::GameWidescreen();
         auroraConfig.windowWidth = configWidescreen ? 854 : 640;
@@ -1545,6 +1575,11 @@ int RuntimeMain(int argc, char** argv) {
 #elif defined(_WIN32)
         static constexpr std::array<GraphicsBackendEntry, 3> kGraphicsBackends{{
             {"auto", BACKEND_AUTO}, {"d3d12", BACKEND_D3D12}, {"vulkan", BACKEND_VULKAN},
+        }};
+#elif defined(__SWITCH__)
+        // deko3d through Dawn's Null device; Aurora picks Null by itself (BACKEND_AUTO).
+        static constexpr std::array<GraphicsBackendEntry, 1> kGraphicsBackends{{
+            {"auto", BACKEND_AUTO},
         }};
 
 #endif

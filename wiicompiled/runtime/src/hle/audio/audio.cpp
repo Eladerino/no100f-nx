@@ -11,6 +11,7 @@
 #include "runtime_log.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <chrono>
 #include <cstdio>
@@ -54,6 +55,11 @@ struct AIDmaState {
 };
 
 AIDmaState g_ai{};
+
+// tracecnt sampler counters (hle/vi.cpp, SCOOBY_TRACE_CNT): incremented on the AI DMA
+// delivery paths below, read host-side through the accessors after this namespace.
+std::atomic<uint32_t> g_traceAiCallbacks{0};
+std::atomic<uint32_t> g_traceAiBlocks{0};
 
 // Audio degradation is invisible to the player except as silence, so every
 // notice below reaches stderr unconditionally. The ones that sit on the
@@ -388,8 +394,30 @@ PPC_NATIVE_OVERRIDE(800F8F88, DSPAssertTask_8015d57c, uint32_t, (uint32_t taskPt
 
 // Each delivered block runs the AI DMA callback and deferred AX task callbacks before the
 // next block, preserving the SoundThread/DSP interleave order real hardware provides.
+// phasetime (PHASETIME design, Nov 19, 2026): host-side audio delivery time - the Tick call
+// itself, which runs the AI DMA callback (guest audio update) on the scheduler thread. Timed
+// with an RAII guard so every return path counts; the tickActive re-entrancy guard means a
+// nested Tick returns immediately and adds ~nothing.
+static std::atomic<uint64_t> g_phaseAudioDelivNanos{0};
+static bool PhaseTimeArmed() {
+    static const bool armed = std::getenv("SCOOBY_PHASETIME") != nullptr;
+    return armed;
+}
+uint64_t PhaseTimeAudioDelivNanosTotal() { return g_phaseAudioDelivNanos.load(std::memory_order_relaxed); }
+
 void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
 {
+    // phasetime: time the delivery (see the totals above).
+    struct PhaseAudioTimer {
+        std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+        ~PhaseAudioTimer() {
+            if (!PhaseTimeArmed()) return;
+            g_phaseAudioDelivNanos.fetch_add(
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - start).count()),
+                std::memory_order_relaxed);
+        }
+    } phaseAudioTimer;
     uint32_t startAddr = 0;
     uint32_t length = 0;
     uint32_t callback = 0;
@@ -454,6 +482,7 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
             g_ai.accumulatorSeconds -= blockDuration;
             g_ai.bytesLeft = 0;
         }
+        g_traceAiBlocks.fetch_add(1, std::memory_order_relaxed);  // tracecnt: one DMA block completed
 
         // Everything below reads what the AX mix wrote (PushAudioBlock) or runs guest code
         // that reads its PB write-back and aux buffers (__AXOutNewFrame via the AI DMA
@@ -491,6 +520,7 @@ void Audio_HLE_Tick(CpuContext* ctx, uint32_t deltaMicros)
                 }
             } else {
                 Memory::TryWrite32(kAICallbackBusyAddr, 1);
+                g_traceAiCallbacks.fetch_add(1, std::memory_order_relaxed);  // tracecnt
                 InvokeIndirectCpu(callback, cpu);
                 Memory::TryWrite32(kAICallbackBusyAddr, 0);
                 AxDspHle::ServiceDeferredCallbacks();
@@ -600,6 +630,7 @@ void AudioTickDeterministic(CpuContext* ctx)
             g_ai.detBlockDueTicks += DetBlockTicks(length, sampleRate);
             g_ai.bytesLeft = 0;
         }
+        g_traceAiBlocks.fetch_add(1, std::memory_order_relaxed);  // tracecnt: one DMA block completed
 
         AxDspHle::JoinMixWorker();
         if (EnsureAudioBackend(sampleRate) && !PushAudioBlock(startAddr, length)) {
@@ -616,6 +647,7 @@ void AudioTickDeterministic(CpuContext* ctx)
             const auto* info = TranslatedFunctionRegistry::FindByAddressPtr(callback);
             if (info && info->rawCpuInvoker) {
                 Memory::TryWrite32(kAICallbackBusyAddr, 1);
+                g_traceAiCallbacks.fetch_add(1, std::memory_order_relaxed);  // tracecnt
                 InvokeIndirectCpu(callback, cpu);
                 Memory::TryWrite32(kAICallbackBusyAddr, 0);
                 AxDspHle::ServiceDeferredCallbacks();
@@ -644,6 +676,18 @@ void AudioTickDeterministic(CpuContext* ctx)
 }
 
 } // namespace
+
+// tracecnt sampler accessors (declared in hle_stubs.h): relaxed loads of the counters the
+// tick paths above maintain. Diagnostics only; no state is touched.
+uint32_t Audio_HLE_TraceAiCallbacks()
+{
+    return g_traceAiCallbacks.load(std::memory_order_relaxed);
+}
+
+uint32_t Audio_HLE_TraceAiBlocks()
+{
+    return g_traceAiBlocks.load(std::memory_order_relaxed);
+}
 
 uint64_t Audio_HLE_DetNextEventTicks()
 {

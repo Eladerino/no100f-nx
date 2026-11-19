@@ -304,6 +304,8 @@ void GxRecordRawVertexDisplayList();
 bool GxDumpFrame();
 void GxBBoxClear();
 void GxBBoxRead(uint16_t& l, uint16_t& t, uint16_t& r, uint16_t& b);
+uint64_t GxBBoxClearCount();
+uint64_t GxBBoxReadCount();
 void GxBBoxVertexMatrix(uint32_t index);
 void GxBBoxPosition(const float* p, int count);
 // Flushes the shadow cursor/count back into guest memory and stops recording.

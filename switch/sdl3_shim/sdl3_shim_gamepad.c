@@ -1,0 +1,541 @@
+// SDL 3 gamepads for the Switch shim, over libnx HID, with HD rumble. The console's main
+// controller (handheld Joy-Cons or player 1: a Pro Controller or paired
+// Joy-Cons) is one SDL gamepad, instance 1. The event pump samples it on the
+// thread that polls events; the getters read that sample, so any thread may
+// call them.
+//
+// Buttons map by position, the SDL convention: south is SDL "south" whatever
+// letter is printed on it, so Switch B is "south", A is "east", Y is "west" and
+// X is "north". Consumers that show a button (prompts, the Controls panel, the
+// settings menu's labels) translate the position into the Switch's printed
+// letter at that seat. ZL/ZR are the analog-trigger axes (GameCube L/R) and R
+// is the right shoulder (GameCube Z).
+#include <SDL3/SDL.h>
+#include <stdio.h>
+#include <string.h>
+#include <switch.h>
+
+#include "sdl3_shim.h"
+
+#define INSTANCE_ID 1
+#define SWITCH_PAD_VENDOR_ID 0x057e
+#define PRODUCT_PRO_CONTROLLER 0x2009
+
+struct SDL_Gamepad {
+    int player_index;
+    SDL_PropertiesID properties;
+};
+
+static struct SDL_Gamepad g_gamepad = {.player_index = 0};
+static bool g_initialized;
+static bool g_connected;
+static int g_open;  // open handles: Aurora and the runtime each open the one gamepad
+static PadState g_pad;
+static Mutex g_lock;
+static u64 g_buttons;
+static HidAnalogStickState g_sticks[2];
+// The pump's result for the getters (SDL_GetGamepadButton/Axis), published with atomics at the end
+// of each pump: PADRead asks for every button separately, and taking g_lock per query cost ~6% of the
+// game thread in a profile. Each value is whole (64/32-bit atomics); a reader may see the sticks of
+// one pump with the buttons of the next, which is the same as polling a moment later.
+static u64 g_pub_buttons;
+static s32 g_pub_sticks[4];  // left x, left y, right x, right y
+
+// Six-axis motion: player 1's devices in the pump's priority order (the handheld
+// sensor, a Pro Controller, paired Joy-Cons left then right). The pump stashes the
+// newest sample from the first connected one; the SDL sensor getters below serve
+// it in SDL's units (m/s^2 for the accelerometer, rad/s for the gyroscope).
+#define SIXAXIS_HANDLES 4
+static HidSixAxisSensorHandle g_sixaxis[SIXAXIS_HANDLES];
+static int g_sixaxis_count;
+static bool g_imu_enabled;   // an SDL consumer asked for sensor data
+static float g_imu_accel[3]; // in g, HID frame (x right, y up, z toward the player)
+static float g_imu_gyro[3];  // rad/s, same frame
+static u64 g_imu_sampling;   // sampling_number of the stashed sample; 0 = none yet
+static Uint64 g_imu_tick;    // SDL_GetTicks() when it was stashed
+
+// Rumble through HD rumble: handheld Joy-Cons, and player 1's paired
+// Joy-Cons or Pro Controller. The pump stops it when its duration ends.
+#define VIBRATION_TARGETS 3
+static HidVibrationDeviceHandle g_vibration[VIBRATION_TARGETS][2];
+static int g_vibration_count[VIBRATION_TARGETS];
+static u64 g_rumble_until;  // system tick; 0 when not rumbling
+
+// The native port's debug server (switch/native/source/cos_debug.cpp): its presses and sticks as if
+// from the controller; while it runs the controller counts as connected even with none attached
+// (docked, Joy-Cons off), or the game would ignore its presses. Weak: the translated port's build
+// has no debug server.
+__attribute__((weak)) int cos_switch_debug_input(uint64_t* buttons, int32_t sticks[4]);
+
+static const struct {
+    SDL_GamepadButton button;
+    u64 mask;
+} kButtons[] = {
+    {SDL_GAMEPAD_BUTTON_SOUTH, HidNpadButton_B},
+    {SDL_GAMEPAD_BUTTON_EAST, HidNpadButton_A},
+    {SDL_GAMEPAD_BUTTON_WEST, HidNpadButton_Y},
+    {SDL_GAMEPAD_BUTTON_NORTH, HidNpadButton_X},
+    {SDL_GAMEPAD_BUTTON_BACK, HidNpadButton_Minus},
+    {SDL_GAMEPAD_BUTTON_START, HidNpadButton_Plus},
+    {SDL_GAMEPAD_BUTTON_LEFT_STICK, HidNpadButton_StickL},
+    {SDL_GAMEPAD_BUTTON_RIGHT_STICK, HidNpadButton_StickR},
+    {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, HidNpadButton_L},
+    {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, HidNpadButton_R},
+    {SDL_GAMEPAD_BUTTON_DPAD_UP, HidNpadButton_Up},
+    {SDL_GAMEPAD_BUTTON_DPAD_DOWN, HidNpadButton_Down},
+    {SDL_GAMEPAD_BUTTON_DPAD_LEFT, HidNpadButton_Left},
+    {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, HidNpadButton_Right},
+};
+
+void sdl3_shim_gamepad_init(void) {
+    if (g_initialized)
+        return;
+    padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+    padInitializeDefault(&g_pad);
+    static const struct {
+        HidNpadIdType id;
+        HidNpadStyleTag style;
+        int handles;
+    } kTargets[VIBRATION_TARGETS] = {
+        {HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld, 2},
+        {HidNpadIdType_No1, HidNpadStyleTag_NpadJoyDual, 2},
+        {HidNpadIdType_No1, HidNpadStyleTag_NpadFullKey, 1},
+    };
+    bool rumble = false;
+    for (int i = 0; i < VIBRATION_TARGETS; ++i) {
+        if (R_SUCCEEDED(hidInitializeVibrationDevices(g_vibration[i], kTargets[i].handles,
+                                                      kTargets[i].id, kTargets[i].style))) {
+            g_vibration_count[i] = kTargets[i].handles;
+            rumble = true;
+        }
+    }
+    static const struct {
+        HidNpadIdType id;
+        HidNpadStyleTag style;
+        int handles;
+    } kSixAxisTargets[3] = {
+        {HidNpadIdType_Handheld, HidNpadStyleTag_NpadHandheld, 1},
+        {HidNpadIdType_No1, HidNpadStyleTag_NpadFullKey, 1},
+        {HidNpadIdType_No1, HidNpadStyleTag_NpadJoyDual, 2},
+    };
+    for (int i = 0; i < 3 && g_sixaxis_count < SIXAXIS_HANDLES; ++i) {
+        HidSixAxisSensorHandle handles[2];
+        if (R_FAILED(hidGetSixAxisSensorHandles(handles, kSixAxisTargets[i].handles, kSixAxisTargets[i].id,
+                                                kSixAxisTargets[i].style)))
+            continue;
+        for (int h = 0; h < kSixAxisTargets[i].handles && g_sixaxis_count < SIXAXIS_HANDLES; ++h) {
+            if (R_SUCCEEDED(hidStartSixAxisSensor(handles[h])))
+                g_sixaxis[g_sixaxis_count++] = handles[h];
+        }
+    }
+    if (g_sixaxis_count > 0)
+        fprintf(stderr, "[switch] six-axis: %d motion sensor(s) started\n", g_sixaxis_count);
+    g_gamepad.properties = SDL_CreateProperties();
+    SDL_SetBooleanProperty(g_gamepad.properties, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, rumble);
+    SDL_SetBooleanProperty(g_gamepad.properties, SDL_PROP_GAMEPAD_CAP_RGB_LED_BOOLEAN, false);
+    g_initialized = true;
+}
+
+static void queue_device_event(Uint32 type) {
+    SDL_Event event;
+    memset(&event, 0, sizeof event);
+    event.type = type;
+    event.gdevice.type = type;
+    event.gdevice.timestamp = SDL_GetTicks() * 1000000ULL;
+    event.gdevice.which = INSTANCE_ID;
+    sdl3_shim_queue_event(&event);
+}
+
+// Low band carries the low-frequency motor, high band the high-frequency one,
+// at the frequencies the console's own rumble defaults to.
+static void send_rumble(float low, float high) {
+    HidVibrationValue values[2];
+    for (int i = 0; i < 2; ++i) {
+        values[i].amp_low = low;
+        values[i].freq_low = 160.0f;
+        values[i].amp_high = high;
+        values[i].freq_high = 320.0f;
+    }
+    for (int i = 0; i < VIBRATION_TARGETS; ++i) {
+        if (g_vibration_count[i] > 0)
+            hidSendVibrationValues(g_vibration[i], values, g_vibration_count[i]);
+    }
+}
+
+// The settings menu opens on F10, a key the console does not have, so a long
+// press of Minus stands in for it (the gesture SwitchWaker uses for its own
+// menu). A short press must stay the game's Minus, and this shim only ever
+// publishes button samples, so a press is held back until it proves short or
+// long: released under the threshold, it is published as a brief press of its
+// own; still down at the threshold, the F10 key events are queued instead and
+// the press is swallowed for as long as it lasts. Holding Minus again closes
+// the menu, because the queued key toggles it.
+#define MINUS_MENU_HOLD_MS 500
+#define MINUS_TAP_MS 50
+
+static Uint64 g_minus_since;      // SDL_GetTicks() when the held press began; 0 when up
+static bool g_minus_consumed;     // the held press already fired the menu
+static Uint64 g_minus_tap_until;  // publish a synthetic short press until this tick
+
+static void queue_key_event(SDL_Scancode scancode, SDL_Keycode key, bool down) {
+    SDL_Event event;
+    memset(&event, 0, sizeof event);
+    event.type = down ? SDL_EVENT_KEY_DOWN : SDL_EVENT_KEY_UP;
+    event.key.type = event.type;
+    event.key.timestamp = SDL_GetTicks() * 1000000ULL;
+    event.key.scancode = scancode;
+    event.key.key = key;
+    event.key.down = down;
+    sdl3_shim_queue_event(&event);
+}
+
+static void queue_f10_tap(void) {
+    queue_key_event(SDL_SCANCODE_F10, SDLK_F10, true);
+    queue_key_event(SDL_SCANCODE_F10, SDLK_F10, false);
+}
+
+// Runs in the pump with g_lock held; returns the buttons to publish.
+static u64 minus_menu_filter(u64 buttons) {
+    const Uint64 now = SDL_GetTicks();
+    if ((buttons & HidNpadButton_Minus) != 0) {
+        if (!g_minus_consumed) {
+            if (g_minus_since == 0)
+                g_minus_since = now;
+            else if (now - g_minus_since >= MINUS_MENU_HOLD_MS) {
+                g_minus_consumed = true;
+                queue_f10_tap();
+            }
+        }
+    } else {
+        // Released short of the threshold: publish the press on its own for
+        // long enough that a frame's input latch cannot miss it.
+        if (g_minus_since != 0 && !g_minus_consumed)
+            g_minus_tap_until = now + MINUS_TAP_MS;
+        g_minus_since = 0;
+        g_minus_consumed = false;
+    }
+    buttons &= ~(u64)HidNpadButton_Minus;
+    if (now < g_minus_tap_until)
+        buttons |= HidNpadButton_Minus;
+    return buttons;
+}
+
+// There is deliberately no menu navigation filter here: the Switch settings
+// menu polls the published sample itself through SDL_GetGamepadButton and
+// tracks its own selection, so the pump publishes the pad as sampled. The
+// runtime blocks the guest while the menu is open (ApplyInputBlockState).
+
+void sdl3_shim_gamepad_pump(void) {
+    if (!g_initialized)
+        return;
+    mutexLock(&g_lock);
+    if (g_rumble_until != 0 && armGetSystemTick() >= g_rumble_until) {
+        g_rumble_until = 0;
+        send_rumble(0.0f, 0.0f);
+    }
+    mutexUnlock(&g_lock);
+    padUpdate(&g_pad);
+    const bool attached = padIsConnected(&g_pad);
+    bool connected = attached;
+    mutexLock(&g_lock);
+    u64 buttons = attached ? padGetButtons(&g_pad) : 0;
+    g_sticks[0] = padGetStickPos(&g_pad, 0);
+    g_sticks[1] = padGetStickPos(&g_pad, 1);
+    if (cos_switch_debug_input) {
+        int32_t sticks[4] = {g_sticks[0].x, g_sticks[0].y, g_sticks[1].x, g_sticks[1].y};
+        if (cos_switch_debug_input(&buttons, sticks))
+            connected = true;
+        g_sticks[0].x = sticks[0], g_sticks[0].y = sticks[1];
+        g_sticks[1].x = sticks[2], g_sticks[1].y = sticks[3];
+    }
+    g_buttons = minus_menu_filter(buttons);
+    // The lock-free copy the getters read (see g_pub_buttons).
+    __atomic_store_n(&g_pub_sticks[0], g_sticks[0].x, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pub_sticks[1], g_sticks[0].y, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pub_sticks[2], g_sticks[1].x, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pub_sticks[3], g_sticks[1].y, __ATOMIC_RELAXED);
+    __atomic_store_n(&g_pub_buttons, g_buttons, __ATOMIC_RELEASE);
+    // Motion, beside the buttons it belongs with: the newest state of the first
+    // connected sensor (hidGetSixAxisSensorStates returns newest first, so one
+    // state is the latest). A sensor whose sampling number stops advancing goes
+    // stale in the getter instead of freezing the remote.
+    for (int i = 0; i < g_sixaxis_count; ++i) {
+        HidSixAxisSensorState state;
+        if (hidGetSixAxisSensorStates(g_sixaxis[i], &state, 1) == 0)
+            continue;
+        if ((state.attributes & HidSixAxisSensorAttribute_IsConnected) == 0)
+            continue;
+        if (state.sampling_number != g_imu_sampling) {
+            g_imu_sampling = state.sampling_number;
+            g_imu_accel[0] = state.acceleration.x;
+            g_imu_accel[1] = state.acceleration.y;
+            g_imu_accel[2] = state.acceleration.z;
+            g_imu_gyro[0] = state.angular_velocity.x;
+            g_imu_gyro[1] = state.angular_velocity.y;
+            g_imu_gyro[2] = state.angular_velocity.z;
+            g_imu_tick = SDL_GetTicks();
+        }
+        break;
+    }
+    mutexUnlock(&g_lock);
+    static int s_attached = -1;
+    if ((int)attached != s_attached) {
+        s_attached = attached;
+        fprintf(stderr, "[switch] controller %s (handheld or player 1)\n", attached ? "connected" : "not connected");
+    }
+    if (connected != g_connected) {
+        g_connected = connected;
+        queue_device_event(connected ? SDL_EVENT_GAMEPAD_ADDED : SDL_EVENT_GAMEPAD_REMOVED);
+    }
+}
+
+SDL_Gamepad* SDL_OpenGamepad(SDL_JoystickID instance_id) {
+    if (instance_id != INSTANCE_ID || !g_connected) {
+        sdl3_shim_set_error("no such gamepad");
+        return NULL;
+    }
+    ++g_open;
+    return &g_gamepad;
+}
+
+void SDL_CloseGamepad(SDL_Gamepad* gamepad) {
+    if (gamepad == &g_gamepad && g_open > 0)
+        --g_open;
+}
+
+bool sdl3_shim_gamepad_connected(void) { return g_connected; }
+
+SDL_Gamepad* sdl3_shim_gamepad_if_open(void) { return g_open > 0 ? &g_gamepad : NULL; }
+
+bool SDL_GetGamepadButton(SDL_Gamepad* gamepad, SDL_GamepadButton button) {
+    if (gamepad != &g_gamepad)
+        return false;
+    const u64 buttons = __atomic_load_n(&g_pub_buttons, __ATOMIC_ACQUIRE);
+    for (size_t i = 0; i < sizeof kButtons / sizeof kButtons[0]; ++i) {
+        if (kButtons[i].button == button)
+            return (buttons & kButtons[i].mask) != 0;
+    }
+    return false;
+}
+
+static Sint16 stick_axis(s32 value, bool invert) {
+    // libnx reports -32767..32767 with up positive; SDL has down positive.
+    if (invert)
+        value = -value;
+    if (value > SDL_JOYSTICK_AXIS_MAX)
+        value = SDL_JOYSTICK_AXIS_MAX;
+    if (value < SDL_JOYSTICK_AXIS_MIN)
+        value = SDL_JOYSTICK_AXIS_MIN;
+    return (Sint16)value;
+}
+
+Sint16 SDL_GetGamepadAxis(SDL_Gamepad* gamepad, SDL_GamepadAxis axis) {
+    if (gamepad != &g_gamepad)
+        return 0;
+    const u64 buttons = __atomic_load_n(&g_pub_buttons, __ATOMIC_ACQUIRE);
+    const HidAnalogStickState left = {__atomic_load_n(&g_pub_sticks[0], __ATOMIC_RELAXED),
+                                      __atomic_load_n(&g_pub_sticks[1], __ATOMIC_RELAXED)};
+    const HidAnalogStickState right = {__atomic_load_n(&g_pub_sticks[2], __ATOMIC_RELAXED),
+                                       __atomic_load_n(&g_pub_sticks[3], __ATOMIC_RELAXED)};
+    switch (axis) {
+    case SDL_GAMEPAD_AXIS_LEFTX: return stick_axis(left.x, false);
+    case SDL_GAMEPAD_AXIS_LEFTY: return stick_axis(left.y, true);
+    case SDL_GAMEPAD_AXIS_RIGHTX: return stick_axis(right.x, false);
+    case SDL_GAMEPAD_AXIS_RIGHTY: return stick_axis(right.y, true);
+    // ZL and ZR are digital; report them fully pressed or released.
+    case SDL_GAMEPAD_AXIS_LEFT_TRIGGER:
+        return (buttons & HidNpadButton_ZL) != 0 ? SDL_JOYSTICK_AXIS_MAX : 0;
+    case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER:
+        return (buttons & HidNpadButton_ZR) != 0 ? SDL_JOYSTICK_AXIS_MAX : 0;
+    default: return 0;
+    }
+}
+
+SDL_JoystickID SDL_GetGamepadID(SDL_Gamepad* gamepad) {
+    return gamepad == &g_gamepad ? INSTANCE_ID : 0;
+}
+
+// The gamepad is its own joystick handle.
+SDL_Joystick* SDL_GetGamepadJoystick(SDL_Gamepad* gamepad) { return (SDL_Joystick*)gamepad; }
+
+SDL_JoystickID SDL_GetJoystickID(SDL_Joystick* joystick) {
+    return (void*)joystick == (void*)&g_gamepad ? INSTANCE_ID : 0;
+}
+
+const char* SDL_GetGamepadName(SDL_Gamepad* gamepad) {
+    return gamepad == &g_gamepad ? "Switch Controller" : NULL;
+}
+
+Uint16 SDL_GetGamepadVendor(SDL_Gamepad* gamepad) {
+    return gamepad == &g_gamepad ? SWITCH_PAD_VENDOR_ID : 0;
+}
+
+Uint16 SDL_GetGamepadProduct(SDL_Gamepad* gamepad) {
+    return gamepad == &g_gamepad ? PRODUCT_PRO_CONTROLLER : 0;
+}
+
+SDL_GamepadType SDL_GetGamepadType(SDL_Gamepad* gamepad) {
+    return gamepad == &g_gamepad ? SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO : SDL_GAMEPAD_TYPE_UNKNOWN;
+}
+
+SDL_PropertiesID SDL_GetGamepadProperties(SDL_Gamepad* gamepad) {
+    return gamepad == &g_gamepad ? g_gamepad.properties : 0;
+}
+
+int SDL_GetGamepadPlayerIndex(SDL_Gamepad* gamepad) {
+    return gamepad == &g_gamepad ? g_gamepad.player_index : -1;
+}
+
+bool SDL_SetGamepadPlayerIndex(SDL_Gamepad* gamepad, int player_index) {
+    if (gamepad != &g_gamepad)
+        return false;
+    g_gamepad.player_index = player_index;
+    return true;
+}
+
+const char* SDL_GetGamepadSerial(SDL_Gamepad* gamepad) {
+    (void)gamepad;
+    return NULL;
+}
+
+SDL_PowerState SDL_GetGamepadPowerInfo(SDL_Gamepad* gamepad, int* percent) {
+    (void)gamepad;
+    if (percent != NULL)
+        *percent = -1;
+    return SDL_POWERSTATE_UNKNOWN;
+}
+
+SDL_PowerState SDL_GetJoystickPowerInfo(SDL_Joystick* joystick, int* percent) {
+    return SDL_GetGamepadPowerInfo((SDL_Gamepad*)joystick, percent);
+}
+
+// SDL's GUID layout: bus, CRC, vendor, 0, product, 0, version, driver bytes.
+SDL_GUID SDL_GetGamepadGUIDForID(SDL_JoystickID instance_id) {
+    SDL_GUID guid;
+    memset(&guid, 0, sizeof guid);
+    if (instance_id == INSTANCE_ID) {
+        guid.data[4] = SWITCH_PAD_VENDOR_ID & 0xff;
+        guid.data[5] = SWITCH_PAD_VENDOR_ID >> 8;
+        guid.data[8] = PRODUCT_PRO_CONTROLLER & 0xff;
+        guid.data[9] = PRODUCT_PRO_CONTROLLER >> 8;
+    }
+    return guid;
+}
+
+void SDL_GetJoystickGUIDInfo(SDL_GUID guid, Uint16* vendor, Uint16* product, Uint16* version,
+                             Uint16* crc16) {
+    if (vendor != NULL)
+        *vendor = (Uint16)(guid.data[4] | guid.data[5] << 8);
+    if (product != NULL)
+        *product = (Uint16)(guid.data[8] | guid.data[9] << 8);
+    if (version != NULL)
+        *version = (Uint16)(guid.data[12] | guid.data[13] << 8);
+    if (crc16 != NULL)
+        *crc16 = (Uint16)(guid.data[2] | guid.data[3] << 8);
+}
+
+const char* SDL_GetGamepadStringForButton(SDL_GamepadButton button) {
+    static const char* const kNames[SDL_GAMEPAD_BUTTON_COUNT] = {
+        [SDL_GAMEPAD_BUTTON_SOUTH] = "a",
+        [SDL_GAMEPAD_BUTTON_EAST] = "b",
+        [SDL_GAMEPAD_BUTTON_WEST] = "x",
+        [SDL_GAMEPAD_BUTTON_NORTH] = "y",
+        [SDL_GAMEPAD_BUTTON_BACK] = "back",
+        [SDL_GAMEPAD_BUTTON_GUIDE] = "guide",
+        [SDL_GAMEPAD_BUTTON_START] = "start",
+        [SDL_GAMEPAD_BUTTON_LEFT_STICK] = "leftstick",
+        [SDL_GAMEPAD_BUTTON_RIGHT_STICK] = "rightstick",
+        [SDL_GAMEPAD_BUTTON_LEFT_SHOULDER] = "leftshoulder",
+        [SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER] = "rightshoulder",
+        [SDL_GAMEPAD_BUTTON_DPAD_UP] = "dpup",
+        [SDL_GAMEPAD_BUTTON_DPAD_DOWN] = "dpdown",
+        [SDL_GAMEPAD_BUTTON_DPAD_LEFT] = "dpleft",
+        [SDL_GAMEPAD_BUTTON_DPAD_RIGHT] = "dpright",
+        [SDL_GAMEPAD_BUTTON_MISC1] = "misc1",
+    };
+    if (button < 0 || button >= SDL_GAMEPAD_BUTTON_COUNT)
+        return NULL;
+    return kNames[button];
+}
+
+const char* SDL_GetGamepadStringForAxis(SDL_GamepadAxis axis) {
+    static const char* const kNames[SDL_GAMEPAD_AXIS_COUNT] = {
+        [SDL_GAMEPAD_AXIS_LEFTX] = "leftx",
+        [SDL_GAMEPAD_AXIS_LEFTY] = "lefty",
+        [SDL_GAMEPAD_AXIS_RIGHTX] = "rightx",
+        [SDL_GAMEPAD_AXIS_RIGHTY] = "righty",
+        [SDL_GAMEPAD_AXIS_LEFT_TRIGGER] = "lefttrigger",
+        [SDL_GAMEPAD_AXIS_RIGHT_TRIGGER] = "righttrigger",
+    };
+    if (axis < 0 || axis >= SDL_GAMEPAD_AXIS_COUNT)
+        return NULL;
+    return kNames[axis];
+}
+
+bool SDL_RumbleGamepad(SDL_Gamepad* gamepad, Uint16 low_frequency_rumble,
+                       Uint16 high_frequency_rumble, Uint32 duration_ms) {
+    if (gamepad != &g_gamepad)
+        return false;
+    mutexLock(&g_lock);
+    // As in SDL, zero intensity stops and a zero duration rumbles until the
+    // next call (Aurora's PAD_MOTOR_RUMBLE asks for exactly that).
+    send_rumble(low_frequency_rumble / 65535.0f, high_frequency_rumble / 65535.0f);
+    const bool off = low_frequency_rumble == 0 && high_frequency_rumble == 0;
+    g_rumble_until = off || duration_ms == 0
+                         ? 0
+                         : armGetSystemTick() + armNsToTicks((u64)duration_ms * 1000000ULL);
+    mutexUnlock(&g_lock);
+    return true;
+}
+
+// No LED yet. Motion sensors are real: see the six-axis block at the top.
+
+bool SDL_SetGamepadLED(SDL_Gamepad* gamepad, Uint8 red, Uint8 green, Uint8 blue) {
+    (void)gamepad;
+    (void)red;
+    (void)green;
+    (void)blue;
+    return false;
+}
+
+bool SDL_GamepadHasSensor(SDL_Gamepad* gamepad, SDL_SensorType type) {
+    if (gamepad != &g_gamepad)
+        return false;
+    return g_sixaxis_count > 0 && (type == SDL_SENSOR_ACCEL || type == SDL_SENSOR_GYRO);
+}
+
+bool SDL_SetGamepadSensorEnabled(SDL_Gamepad* gamepad, SDL_SensorType type, bool enabled) {
+    if (!SDL_GamepadHasSensor(gamepad, type))
+        return false;
+    // HID starts the accelerometer and gyroscope together, so one flag serves both.
+    mutexLock(&g_lock);
+    g_imu_enabled = enabled;
+    mutexUnlock(&g_lock);
+    return true;
+}
+
+bool SDL_GetGamepadSensorData(SDL_Gamepad* gamepad, SDL_SensorType type, float* data,
+                              int num_values) {
+    if (data == NULL || num_values < 3 || !SDL_GamepadHasSensor(gamepad, type))
+        return false;
+    mutexLock(&g_lock);
+    // Fresh means: enabled, at least one sample seen, and its sampling number
+    // advanced within the last 100 ms.
+    const bool fresh = g_imu_enabled && g_imu_sampling != 0 && SDL_GetTicks() - g_imu_tick <= 100;
+    const float* src = type == SDL_SENSOR_ACCEL ? g_imu_accel : g_imu_gyro;
+    const float v[3] = {src[0], src[1], src[2]};
+    mutexUnlock(&g_lock);
+    if (!fresh)
+        return false;
+    if (type == SDL_SENSOR_ACCEL) {
+        // HID reports g; SDL wants m/s^2 (SDL_STANDARD_GRAVITY).
+        data[0] = v[0] * 9.80665f;
+        data[1] = v[1] * 9.80665f;
+        data[2] = v[2] * 9.80665f;
+    } else {
+        data[0] = v[0];
+        data[1] = v[1];
+        data[2] = v[2];
+    }
+    return true;
+}

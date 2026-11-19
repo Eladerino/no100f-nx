@@ -641,23 +641,38 @@ RECOMP_MEMORY_FORCE_INLINE void FlatWriteFloat64(uint32_t address, double value)
 // instead of dispatched inline. Never use these for an address the translator hasn't proven.
 
 RECOMP_MEMORY_FORCE_INLINE void FlatWriteRam8(uint32_t address, uint8_t value) {
+#if defined(__SWITCH__)
+    if (GuestFlat::RequiresCheckedAccess()) { Memory::Write8(address, value); return; }
+#endif
     FlatStore<uint8_t>(address, value);
 }
 
 RECOMP_MEMORY_FORCE_INLINE void FlatWriteRam16(uint32_t address, uint16_t value) {
+#if defined(__SWITCH__)
+    if (GuestFlat::RequiresCheckedAccess()) { Memory::Write16(address, value); return; }
+#endif
     FlatStore<uint16_t>(address, value);
 }
 
 RECOMP_MEMORY_FORCE_INLINE void FlatWriteRam32(uint32_t address, uint32_t value) {
+#if defined(__SWITCH__)
+    if (GuestFlat::RequiresCheckedAccess()) { Memory::Write32(address, value); return; }
+#endif
     FlatStore<uint32_t>(address, value);
 }
 
 
 RECOMP_MEMORY_FORCE_INLINE void FlatWriteRamFloat32(uint32_t address, double value) {
+#if defined(__SWITCH__)
+    if (GuestFlat::RequiresCheckedAccess()) { Memory::WriteFloat32(address, value); return; }
+#endif
     FlatStore<uint32_t>(address, ConvertPpcDoubleToSingleBits(value));
 }
 
 RECOMP_MEMORY_FORCE_INLINE void FlatWriteRamFloat64(uint32_t address, double value) {
+#if defined(__SWITCH__)
+    if (GuestFlat::RequiresCheckedAccess()) { Memory::WriteFloat64(address, value); return; }
+#endif
     uint64_t bits = 0;
     std::memcpy(&bits, &value, sizeof(bits));
     FlatStore<uint64_t>(address, bits);

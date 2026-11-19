@@ -55,3 +55,10 @@ AGENTS.md
 
 # Claude Code's local folder, never tracked: tools/setup-agents.py links .claude/skills to the tracked .agents/skills
 /.claude/
+/pgo/*.profraw
+/switch-logs/
+/*-backup/
+/*-stage/
+/*-pristine/
+*.nro
+*.profraw

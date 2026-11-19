@@ -12,6 +12,9 @@
 #include "gx/shader_info.hpp"
 #include "imgui.hpp"
 #include "webgpu/gpu.hpp"
+#if defined(__SWITCH__) && defined(FW_SWITCH_DEKO)
+#include "deko/dk_aurora.h"
+#endif
 #include "webgpu/metalfx.hpp"
 #include <webgpu/webgpu_cpp.h>
 #endif
@@ -313,6 +316,9 @@ bool run_frame_worker_cycle(gfx::SealedFrame& sealedFrame);
 #endif
 
 void frame_worker_main() noexcept {
+#ifdef __SWITCH__
+  fw_switch_thread_mark(FW_THREAD_RENDER);  // switch/runtime/horizon_pthread.c (guestcore: core 1)
+#endif
   {
     std::lock_guard lock(g_frameWorker.mutex);
     g_frameWorker.threadId = std::this_thread::get_id();
@@ -385,10 +391,25 @@ bool frame_worker_phase_reached(FrameWorkerPhase phase) noexcept {
 
 bool wait_for_frame_worker_private_for(FrameWorkerPhase phase, std::chrono::microseconds timeout);
 
+// Time callers (the game thread: GXCopyDisp, the FIFO drain, end_frame, staging splits) spent blocked
+// on the frame worker, per phase, since start; aurora_frame_worker_wait_totals hands them out.
+std::atomic<uint64_t> g_frameWorkerWaitNanos[2]{};  // [0] SEALED, [1] DONE
+std::atomic<uint64_t> g_frameWorkerWaits[2]{};
+
 void wait_for_frame_worker_private(FrameWorkerPhase phase) {
   constexpr auto kWaitServiceInterval = std::chrono::milliseconds(1);
+  if (frame_worker_phase_reached(phase)) {
+    return;  // the common case: nothing to wait for, nothing to time
+  }
+  const auto started = std::chrono::steady_clock::now();
   while (!wait_for_frame_worker_private_for(phase, kWaitServiceInterval)) {
   }
+  const int slot = phase == FrameWorkerPhase::Sealed ? 0 : 1;
+  g_frameWorkerWaitNanos[slot].fetch_add(
+      static_cast<uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()),
+      std::memory_order_relaxed);
+  g_frameWorkerWaits[slot].fetch_add(1, std::memory_order_relaxed);
 }
 
 bool wait_for_frame_worker_private_for(FrameWorkerPhase phase, std::chrono::microseconds timeout) {
@@ -1019,8 +1040,9 @@ AuroraInfo initialize(int argc, char* argv[], const AuroraConfig& config) {
               backend_name(requestedBackend), backend_name(selectedBackend));
   }
 
-  // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend
-  if (webgpu::g_backendType == wgpu::BackendType::Null) {
+  // Initialize SDL_Renderer for ImGui when we can't use a Dawn backend (surfaceless: ImGui still
+  // records through Dawn's Null device, and the Switch's SDL has no renderer)
+  if (webgpu::g_backendType == wgpu::BackendType::Null && !webgpu::kSurfaceless) {
     ASSERT(window::create_renderer(), "Failed to initialize SDL renderer: {}", SDL_GetError());
   }
 #else
@@ -1074,7 +1096,7 @@ std::optional<AcquiredSurfaceTexture> acquire_surface_texture() noexcept {
     request_surface_reconfigure();
     return std::nullopt;
   }
-  if (!g_surface) {
+  if (!webgpu::surface_ready()) {
     request_surface_reconfigure();
     return std::nullopt;
   }
@@ -1184,6 +1206,27 @@ bool present_presentation_job(const PresentationJob& job) {
   std::chrono::nanoseconds scheduleWaitDuration{};
   std::chrono::nanoseconds presentDuration{};
   bool presented = false;
+  if constexpr (webgpu::kSurfaceless) {
+    // Nothing to present to: keep the schedule's pacing and drop the image.
+    if (job.presentAt != PresentClock::time_point{}) {
+      wait_until_precise(job.presentAt);
+    }
+#if defined(__SWITCH__) && defined(FW_SWITCH_DEKO)
+    // H3: on Switch the picture goes to the deko3d interposer (switch/deko) instead of being
+    // dropped. It blocks until a swapchain image is free, which paces this branch to vsync.
+    aurora_switch_dk_present(job.image->texture.texture.Get());
+#endif
+    record_successful_present(job.interpolated, job.logicalFrame, {}, {}, {}, {}, {},
+                              std::chrono::duration_cast<std::chrono::nanoseconds>(PresentClock::now() -
+                                                                                   submissionStarted),
+                              job.duplicated, job.slidPeriods, {});
+    // The only sign of life on a screen that stays black: a line every ten seconds at 60 fps.
+    static uint64_t s_surfacelessFrames = 0;
+    if (++s_surfacelessFrames % 600 == 0) {
+      Log.info("Surfaceless: {} frames (logical frame {})", s_surfacelessFrames, job.logicalFrame);
+    }
+    return true;
+  }
   if (g_surfaceReconfigurePending.load(std::memory_order_acquire) ||
       window::native_resize_pending() || !window::is_presentable()) {
     return false;
@@ -1390,6 +1433,9 @@ PresenterState g_presenter;
 std::atomic<bool> g_presenterStarted{false};
 
 void presenter_main() noexcept {
+#ifdef __SWITCH__
+  fw_switch_thread_mark(FW_THREAD_RENDER);  // switch/runtime/horizon_pthread.c (guestcore: core 1)
+#endif
   if (!SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH)) {
     Log.warn("Could not raise the asynchronous presenter thread priority: {}", SDL_GetError());
   }
@@ -1718,7 +1764,8 @@ bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy, bool* imgui
   const bool surfaceReconfigurePending =
       g_surfaceReconfigurePending.load(std::memory_order_acquire);
   const bool surfaceMutationRequired =
-      surfaceReconfigurePending || webgpu::vsync_change_pending() || !window::is_presentable() || !g_surface ||
+      surfaceReconfigurePending || webgpu::vsync_change_pending() || !window::is_presentable() ||
+      !webgpu::surface_ready() ||
       window::native_resize_pending() ||
       !window::native_window_size_matches(
           webgpu::g_graphicsConfig.surfaceConfiguration.width,
@@ -1743,12 +1790,12 @@ bool begin_frame_impl(bool pumpEvents, ImGuiFramePolicy imguiPolicy, bool* imgui
         g_surfaceReconfigurePending.exchange(false, std::memory_order_acq_rel);
     const bool consumeSurfaceRecreate =
         g_surfaceRecreatePending.exchange(false, std::memory_order_acq_rel);
-    if (!g_surface || consumeSurfaceReconfigure) {
+    if (!webgpu::surface_ready() || consumeSurfaceReconfigure) {
       // Reconfigure in place unless the surface was actually lost. See
       // g_surfaceRecreatePending for why destroying a live surface here is fatal
       // while a capture overlay is attached.
       webgpu::refresh_surface(consumeSurfaceRecreate);
-      if (!g_surface) {
+      if (!webgpu::surface_ready()) {
         return false;
       }
     }
@@ -2229,7 +2276,7 @@ bool begin_frame() {
   // A surface mutation can legitimately fail preparation, and optimistic success would let GX/ImGui
   // record into a frame that was never begun, so join this path and return its real result.
   waitForSurfacePreparation =
-      !window::is_presentable() || !g_surface ||
+      !window::is_presentable() || !webgpu::surface_ready() ||
       window::native_resize_pending() || window::is_paused() ||
       !window::native_window_size_matches(
           webgpu::g_graphicsConfig.surfaceConfiguration.width,
@@ -2342,6 +2389,17 @@ void aurora_set_frame_worker_wait_callback(AuroraFrameWorkerWaitCallback callbac
   aurora::g_frameWorkerWaitCallback.store(callback, std::memory_order_release);
 }
 void aurora_wait_for_frame_worker() { aurora::wait_for_frame_worker(); }
+void aurora_frame_worker_wait_totals(uint64_t* sealedNanos, uint64_t* doneNanos, uint64_t* sealedWaits,
+                                     uint64_t* doneWaits) {
+  *sealedNanos = aurora::g_frameWorkerWaitNanos[0].load(std::memory_order_relaxed);
+  *doneNanos = aurora::g_frameWorkerWaitNanos[1].load(std::memory_order_relaxed);
+  *sealedWaits = aurora::g_frameWorkerWaits[0].load(std::memory_order_relaxed);
+  *doneWaits = aurora::g_frameWorkerWaits[1].load(std::memory_order_relaxed);
+}
+bool aurora_frame_worker_idle() {
+  return aurora::frame_worker_phase_reached(aurora::FrameWorkerPhase::Sealed) &&
+         aurora::frame_worker_phase_reached(aurora::FrameWorkerPhase::Done);
+}
 bool aurora_wait_for_frame_worker_for(uint32_t timeoutMicros) {
   return aurora::wait_for_frame_worker_for(std::chrono::microseconds(timeoutMicros));
 }

@@ -900,6 +900,9 @@ static bool write_pipeline_cache_record(const PipelineCacheWrite& write) {
 }
 
 static void pipeline_cache_writer() {
+#ifdef __SWITCH__
+  fw_switch_thread_mark(FW_THREAD_BACKGROUND);  // switch/runtime/horizon_pthread.c (bgprio)
+#endif
 #ifdef TRACY_ENABLE
   tracy::SetThreadName("Pipeline cache writer thread");
 #endif
@@ -988,6 +991,9 @@ static void compile_pending_pipeline(PendingPipeline pending) {
 }
 
 static void pipeline_worker() {
+#ifdef __SWITCH__
+  fw_switch_thread_mark(FW_THREAD_BACKGROUND);  // switch/runtime/horizon_pthread.c (bgprio)
+#endif
 #ifdef TRACY_ENABLE
   tracy::SetThreadName("Pipeline compilation thread");
 #endif

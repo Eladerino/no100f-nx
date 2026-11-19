@@ -12,3 +12,12 @@
 #include "isa/ppc_isa_int.h"
 #include "isa/ppc_isa_float.h"
 #include "isa/ppc_isa_quantized.h"
+
+#include <cstdint>
+
+// Executor safepoint (SAFEPOINT-DESIGN, Route A): the translator emits a
+// check calling these at call-free back-edges in generated code. Implemented
+// in the runtime (hle/vi.cpp); declared here because every generated unit
+// includes this header.
+extern "C" bool GuestSafepointRequested();
+extern "C" void GuestSafepointServe(CpuContext* ctx, uint32_t backEdgeTarget);

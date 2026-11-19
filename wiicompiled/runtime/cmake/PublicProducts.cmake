@@ -382,6 +382,9 @@ endif()
 # tuning rather than leaving target-specific performance on the table.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(AMD64|amd64|x86_64|X86_64)$")
     set(RECOMP_BASELINE_ARCH_FLAG -march=x86-64-v3)
+elseif(RECOMP_PLATFORM_SWITCH)
+    # Cross-compiled for the one CPU every Switch has (Tegra X1).
+    set(RECOMP_BASELINE_ARCH_FLAG -mcpu=cortex-a57)
 elseif(RECOMP_PLATFORM_ANDROID)
     # Cross-compiled, so -mcpu=native would describe the build machine. ARMv8.2-A (LSE atomics,
     # RCpc loads) is the floor of every Android phone since Cortex-A55/A75.

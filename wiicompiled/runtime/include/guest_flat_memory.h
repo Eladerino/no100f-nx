@@ -19,6 +19,10 @@ inline constexpr size_t kGuestPageSize = 0x1000;
 // 16 TiB: clear of the Windows ASan shadow (32 TiB) and of the usual image/heap
 // placement.
 inline constexpr uintptr_t kFixedFlatGuestBase = 0x0000'1000'0000'0000ull;
+#elif defined(__SWITCH__)
+// No fixed base: Horizon randomizes where its heap, alias and stack regions land in the 39-bit
+// address space. switch/runtime/guest_flat_memory_horizon.cpp takes the window from free
+// code-region space at startup instead; RECOMP_FLAT_GUEST_BASE below. (Ported from spm-nx.)
 #elif defined(__aarch64__) && defined(__APPLE__)
 // Keep this well above the low address ranges that Darwin's ASLR may use for
 // a PIE executable and its shared cache. Apple Silicon's user VA is wider
@@ -40,7 +44,15 @@ inline constexpr uintptr_t kFixedFlatGuestBase = 0x0000'0010'0000'0000ull;
 #error "guest_flat_memory.h has no fixed flat guest base chosen for this architecture"
 #endif
 
+#if defined(__SWITCH__)
+} // namespace GuestFlat
+// The window's runtime base, written once before guest code runs (switch/runtime/horizon_flat_base.c).
+extern "C" uint8_t* const recomp_flat_guest_base;
+#define RECOMP_FLAT_GUEST_BASE (::recomp_flat_guest_base)
+namespace GuestFlat {
+#else
 #define RECOMP_FLAT_GUEST_BASE (reinterpret_cast<uint8_t*>(GuestFlat::kFixedFlatGuestBase))
+#endif
 
 enum class Backing {
     Owned,
@@ -77,7 +89,14 @@ bool IsActive();
 #define RECOMP_GUEST_FLAT_FIXED_PAGE_SIZE 1
 #endif
 
-#if defined(RECOMP_GUEST_FLAT_FIXED_PAGE_SIZE)
+#if defined(__SWITCH__)
+// Horizon uses 4 KiB pages: flat unless built in the checked bring-up mode.
+#if defined(RECOMP_SWITCH_CHECKED_GUEST_MEMORY)
+inline constexpr bool RequiresCheckedAccess() noexcept { return true; }
+#else
+inline constexpr bool RequiresCheckedAccess() noexcept { return false; }
+#endif
+#elif defined(RECOMP_GUEST_FLAT_FIXED_PAGE_SIZE)
 inline constexpr bool RequiresCheckedAccess() noexcept { return false; }
 #else
 extern bool g_requiresCheckedAccess;
