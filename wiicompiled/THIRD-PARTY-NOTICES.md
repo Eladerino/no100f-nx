@@ -110,6 +110,15 @@ fallback - though this project's x86_64-only target only ever compiles amd64.c) 
 Source: <https://github.com/higan-emu/libco>. Full license text:
 `runtime/third_party/libco/LICENSE`.
 
+### Embedded fonts - Apache-2.0
+
+The runtime embeds two fonts into the NRO:
+
+- **Luckiest Guy** by Astigmatic - Apache License 2.0, embedded by `runtime/cmake/embed_fonts.cmake`.
+- **Roboto-Medium** by Christian Robertson - Apache License 2.0, embedded by `runtime/cmake/embed_fonts.cmake`.
+
+Full license text: `../switch/licenses/Apache-2.0.txt`.
+
 ---
 
 ## Fetched at build time and redistributed in release builds

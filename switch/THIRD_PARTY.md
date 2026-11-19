@@ -6,6 +6,10 @@ switch layer comes from SwitchWaker and SwitchWakerHD, under their own licenses,
 starting with `fw_`, `sdl3_shim/sdl3_shim_frightworks.c`, `cmake/FrightWorksSwitch.cmake` and
 `scripts/build-switch.sh` were written for this port. Everything not listed below is GPLv3.
 
+The MPL-2.0 code in the table below (`source/debug_server.h`, `source/debug_server.cpp`, the
+`deko` wgpu interposer) is SwitchWakerHD-derived; the source as used in this port lives at
+[Eladerino/no100f-nx](https://github.com/Eladerino/no100f-nx).
+
 | Path | Origin | License |
 |---|---|---|
 | `sdl3_shim/` (all files but `sdl3_shim_wiicompiled.c` and `sdl3_shim_frightworks.c`) | [SwitchWaker](https://github.com/centollOS/SwitchWaker) `switch/aurora/sdl3_shim/` at `92307ff`, through spm-nx, with the changes in `sdl3_shim/PATCHES.md` | MIT (`licenses/SwitchWaker-MIT.txt`) |
@@ -25,5 +29,8 @@ Fetched at build time, not stored here:
 | Dependency | Version | License |
 |---|---|---|
 | [Dawn](https://github.com/encounter/dawn) (with Tint and abseil) | `266c1cf`, SwitchWaker's pin (`dawn/dawn.cmake`) | BSD-3-Clause, Apache-2.0 (abseil) |
+| [deko3d](https://github.com/devkitPro/deko3d) | `switch/deko3d/`, vendored 0.5.0 + SwitchWaker patches, via spm-nx | zlib |
+| [uam](https://github.com/devkitPro/uam) | `switch/uam/`, vendored 1.1.0 + SwitchWaker patches 1-9, via spm-nx | zlib + MIT (Mesa parts) |
+| deko wgpu interposer | `switch/deko/`, ported from spm-nx's switch/deko (itself from SwitchWaker/SwitchWakerHD) | MPL-2.0 |
 | [SDL 3](https://github.com/libsdl-org/SDL) headers | 3.4.4, Aurora's pin | Zlib |
 | devkitPro devkitA64, libnx | the image digest in `scripts/Containerfile` | GPL (toolchain), ISC (libnx) |
