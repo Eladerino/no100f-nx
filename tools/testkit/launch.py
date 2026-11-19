@@ -154,7 +154,7 @@ def find_build_id(text) -> str:
 
 # Paths that are not inputs of the game build: a change to them since the build does not make the build stale.
 TEST_ONLY_PREFIXES = ("tools/testkit/", "docs/", "autotest/")
-TEST_ONLY_FILES = ("tools/smoke-test.py", "tools/level-sweep.py")
+TEST_ONLY_FILES = ("tools/smoke-test.py", "tools/level-sweep.py", "tools/det-check.py")
 
 
 def is_test_only(path: str) -> bool:
@@ -165,7 +165,7 @@ def check_build(found, expected: BuildId, repo=None):
     """(ok, message): was the game built from the code under test?
     Identical ID: yes. Otherwise, for a clean build of the same branch, `git diff --name-only <built commit>` (that commit
     against the working tree, committed and uncommitted tracked changes) must name only files outside the build's
-    inputs (tools/testkit/, tools/smoke-test.py, tools/level-sweep.py, docs/, *.md, autotest/): then the run is accepted and says which files
+    inputs (tools/testkit/, tools/smoke-test.py, tools/level-sweep.py, tools/det-check.py, docs/, *.md, autotest/): then the run is accepted and says which files
     differ. Anything else, a build made from uncommitted changes that are gone or different now included, fails:
     rebuild. Without `repo` only the exact ID passes."""
     if not found:
