@@ -4,6 +4,11 @@
 #include "isa/big_endian.h"
 #include "recomp_mod_loader.h"
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
+
 // Opcode constants and the stream helpers this file shares with gx_dl.cpp /
 // gx_vertex.cpp; see gx_stream_common.h.
 using namespace GxCmd;
@@ -17,7 +22,43 @@ uint16_t g_gxPeToken = 0;
 extern "C" uint32_t No100f_GXReadDrawSync() { return g_gxPeToken; }
 PPC_NATIVE_OVERRIDE(800FDE88, No100f_GXReadDrawSync, uint32_t, (), ());
 
-void QueueGuestCallback(uint32_t callbackPtr, uint32_t r3, uint32_t r4);  // hle/storage/dvd.cpp
+void QueueGuestCallback(uint32_t callbackPtr, uint32_t r3, uint32_t r4);
+void QueueGxInterruptCallback(uint32_t callbackPtr, uint32_t r3, uint32_t r4);  // hle/storage/dvd.cpp
+
+// Follow-up instrument (SEAMFIX-FOLLOWUP-STUDY, Nov 16, 2026): per-boot counters
+// for the two GX completion sites - No100f_GXEnableBreakPt calls and
+// RaisePeInterruptForBp hits by register - so one storm boot separates "the guest
+// stops calling" from "the FIFO stops reaching the site" and sizes how often the
+// PE path fires in this title. Pure observation: relaxed atomics, no guest-visible
+// state; the getters are read by the tracecnt sampler in hle/vi.cpp ([gxcnt]).
+static std::atomic<uint32_t> g_gxBreakPtCalls{0};
+static std::atomic<uint32_t> g_peHitsToken{0};     // reg 0x47: token + interrupt
+static std::atomic<uint32_t> g_peHitsDrawDone{0};  // reg 0x45: draw done
+static std::atomic<uint32_t> g_peHitsSync{0};      // reg 0x48: PE token write
+static std::atomic<uint32_t> g_peHitsOther{0};     // every other BP register
+uint32_t GxFifo_HLE_BreakPtCalls() { return g_gxBreakPtCalls.load(std::memory_order_relaxed); }
+uint32_t GxFifo_HLE_PeHitsToken() { return g_peHitsToken.load(std::memory_order_relaxed); }
+uint32_t GxFifo_HLE_PeHitsDrawDone() { return g_peHitsDrawDone.load(std::memory_order_relaxed); }
+uint32_t GxFifo_HLE_PeHitsSync() { return g_peHitsSync.load(std::memory_order_relaxed); }
+uint32_t GxFifo_HLE_PeHitsOther() { return g_peHitsOther.load(std::memory_order_relaxed); }
+
+// Fix 2 (FIX2-DESIGN-STUDY Part B): per-present completion flag. Set at the two
+// queue sites in this file that queue a frame-swap completion -
+// No100f_GXEnableBreakPt below and the RaisePeInterruptForBp draw-done branch -
+// regardless of which deque the entry takes; read and cleared only by the Fix 2
+// present hook in hle/vi.cpp, once per present, as the input to its synthesis
+// decision. A set flag at the hook means a genuine completion was queued in
+// the current present interval, so the hook must not synthesize a second one;
+// a genuine call landing after the hook sets the flag for the next interval
+// and can only suppress one synthesis there, never double one. Host-side
+// bookkeeping only: a relaxed atomic, no guest-visible state.
+static std::atomic<bool> g_gxPresentCompletionQueued{false};
+void GxFifo_HLE_NotePresentCompletion() {
+    g_gxPresentCompletionQueued.store(true, std::memory_order_relaxed);
+}
+bool GxFifo_HLE_TakePresentCompletion() {
+    return g_gxPresentCompletionQueued.exchange(false, std::memory_order_relaxed);
+}
 
 // The PE interrupts a raw BP write raises on hardware, delivered like __GXTokenInterruptHandler /
 // __GXFinishInterruptHandler would (NO100F globals). Draws are consumed in order, so they fire at once.
@@ -25,11 +66,24 @@ void QueueGuestCallback(uint32_t callbackPtr, uint32_t r3, uint32_t r4);  // hle
 // NO100F GXEnableBreakPt: the engine's frame swap sets a CP FIFO breakpoint at the write pointer and sleeps until
 // GXCPInterruptHandler calls the GXSetBreakPtCallback callback. The FIFO is consumed as it is written, so the
 // breakpoint is already reached: deliver the callback (no arguments) at once.
+// seamfix reroute (SEAMFIX-FOLLOWUP-STUDY fix 1, Nov 16, 2026): the callback read
+// here is the display-sync advancer (func_80175AA4) - the frame-swap completion the
+// display-sync park turns on. The seam build held only the RaisePeInterruptForBp
+// class, which never fired in its proving boot; this site queued the advancer into
+// the general deque, whose restore-time deliveries spent it on the awake waiter.
+// When seamfix is armed the callback joins the held GX class instead, so the seam
+// pass delivers it after the waiter links; unarmed it takes the general deque
+// exactly as before.
 extern "C" void No100f_GXEnableBreakPt(uint32_t breakPt) {
     (void)breakPt;
+    g_gxBreakPtCalls.fetch_add(1, std::memory_order_relaxed);
     constexpr uint32_t kBreakPointCallbackAddr = 0x802712A4u;  // BreakPointCB (r13-0x6FDC)
     uint32_t cb = 0;
-    if (Memory::TryRead32(kBreakPointCallbackAddr, cb) && cb) QueueGuestCallback(cb, 0, 0);
+    if (Memory::TryRead32(kBreakPointCallbackAddr, cb) && cb) {
+        if (OS_HLE_SeamFixArmed()) QueueGxInterruptCallback(cb, 0, 0);
+        else QueueGuestCallback(cb, 0, 0);
+        GxFifo_HLE_NotePresentCompletion();  // Fix 2: a frame-swap completion was queued in this present interval
+    }
 }
 PPC_NATIVE_OVERRIDE_VOID(800FCBDC, No100f_GXEnableBreakPt, (uint32_t breakPt), (breakPt));
 
@@ -69,15 +123,22 @@ static void RaisePeInterruptForBp(uint32_t bpWord) {
     constexpr uint32_t kFinishQueueAddr = 0x802712BCu;       // FinishQueue (r13-0x6FC4)
     constexpr uint32_t kOSWakeupThread = 0x801087F4u;
     const uint32_t reg = bpWord >> 24;
+    if (reg == 0x47u) g_peHitsToken.fetch_add(1, std::memory_order_relaxed);
+    else if (reg == 0x45u) g_peHitsDrawDone.fetch_add(1, std::memory_order_relaxed);
+    else if (reg == 0x48u) g_peHitsSync.fetch_add(1, std::memory_order_relaxed);
+    else g_peHitsOther.fetch_add(1, std::memory_order_relaxed);
     if (reg == 0x48u) g_gxPeToken = static_cast<uint16_t>(bpWord);  // PE token, read by GXReadDrawSync
     uint32_t cb = 0;
     if (reg == 0x47u) {  // token + interrupt
         g_gxPeToken = static_cast<uint16_t>(bpWord);
-        if (Memory::TryRead32(kTokenCallbackAddr, cb) && cb) QueueGuestCallback(cb, bpWord & 0xFFFFu, 0);
+        if (Memory::TryRead32(kTokenCallbackAddr, cb) && cb) QueueGxInterruptCallback(cb, bpWord & 0xFFFFu, 0);
     } else if (reg == 0x45u && (bpWord & 2u)) {  // draw done + interrupt (GXSetDrawDone)
         try { Memory::Write8(kDrawDoneFlagAddr, 1); } catch (const Memory::AccessViolation&) {}
-        if (Memory::TryRead32(kDrawDoneCallbackAddr, cb) && cb) QueueGuestCallback(cb, 0, 0);
-        QueueGuestCallback(kOSWakeupThread, kFinishQueueAddr, 0);
+        if (Memory::TryRead32(kDrawDoneCallbackAddr, cb) && cb) {
+            QueueGxInterruptCallback(cb, 0, 0);
+            GxFifo_HLE_NotePresentCompletion();  // Fix 2: as above (unfed in this title; armed for completeness)
+        }
+        QueueGxInterruptCallback(kOSWakeupThread, kFinishQueueAddr, 0);
     }
 }
 
@@ -451,13 +512,76 @@ static bool IsCommandByte(u32 v) {
            v == 0x48 || v == 0x61 || (v >= 0x80 && v <= 0xBF);
 }
 
+// Gather-pipe traffic from the game thread since start, for hle/vi.cpp's per-600-frame line: every
+// translated store to 0xCC008000 is one HleFifoWrite (memory.cpp Write*Slow -> gx_stubs.cpp), so the
+// call count is the per-word dispatch cost the route profile showed (~14% of the game thread).
+// Game thread only: plain counters.
+static uint64_t g_fifoWriteCalls = 0, g_fifoWriteBytes = 0, g_fifoDlWriteCalls = 0, g_fifoBurstCalls = 0,
+                g_fifoBurstBytes = 0;
+void GxFifoWriteTotals(uint64_t* calls, uint64_t* bytes, uint64_t* dlCalls, uint64_t* burstCalls,
+                       uint64_t* burstBytes) {
+    *calls = g_fifoWriteCalls;
+    *bytes = g_fifoWriteBytes;
+    *dlCalls = g_fifoDlWriteCalls;
+    *burstCalls = g_fifoBurstCalls;
+    *burstBytes = g_fifoBurstBytes;
+}
+
+// The raw-write ring above costs a store and an execution-address read on every pipe word; it is
+// only read by DumpPipeRing (zero-count draws). On with NO100F_PIPE_RING (dk_diag "pipering").
+static bool PipeRingEnabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("NO100F_PIPE_RING");
+        return e != nullptr && e[0] != '0';
+    }();
+    return on;
+}
+
+// fifofast (NO100F_FIFO_FAST; dk_diag "fifofast", "fifofast=2"): once a raw draw's header is in and
+// its whole packet size is known, later pipe words are only appended until the packet is complete,
+// instead of re-running the parse loop (header read, vertex-size lookup) on every word. The packet
+// bytes and the moment it is submitted are the same as the slow path's: the parse loop runs again
+// exactly when the buffered bytes reach the size the slow path would wait for. The pending state is
+// trusted only while the buffer still starts with the same 3 header bytes, and any reset drops it.
+// Mode 2 also recomputes the packet size on every fast-path word, as the slow path would, and logs
+// the first time they differ (then falls back to the slow path for that packet).
+static int FifoFastMode() {
+    static const int mode = [] {
+        const char* e = std::getenv("NO100F_FIFO_FAST");
+        return e == nullptr ? 0 : std::atoi(e);
+    }();
+    return mode;
+}
+static uint32_t g_pendingRawPacketBytes = 0;  // 0: none
+static uint8_t g_pendingRawHeader[3] = {};
+static uint64_t g_fifoFastWords = 0, g_fifoFastMismatches = 0;
+void GxFifoFastTotals(uint64_t* fastWords, uint64_t* mismatches) {
+    *fastWords = g_fifoFastWords;
+    *mismatches = g_fifoFastMismatches;
+}
+
+// phasetime (PHASETIME design, Nov 19, 2026): the first GX packet the parser completes after
+// each present, as a steady-clock timestamp (nanos since epoch; 0 = none this interval).
+// Written here (the parser's consumeBytes choke: every parse-loop completion passes through
+// it; the vertex-by-vertex path below does not), read + cleared by hle/vi.cpp's present hook.
+static std::atomic<uint64_t> g_phaseFirstPacketNanos{0};
+static bool PhaseTimeArmed() {
+    static const bool armed = std::getenv("SCOOBY_PHASETIME") != nullptr;
+    return armed;
+}
+uint64_t PhaseTimeFirstPacketNanos() { return g_phaseFirstPacketNanos.load(std::memory_order_relaxed); }
+void PhaseTimeClearFirstPacket() { g_phaseFirstPacketNanos.store(0, std::memory_order_relaxed); }
+
 void HleFifoWrite(u32 val, uint32_t sizeBytes) {
+    ++g_fifoWriteCalls;
+    g_fifoWriteBytes += sizeBytes == 0 ? 4 : sizeBytes;
     const bool recordOnly = IsDisplayListActive();
     if (recordOnly) {
+        ++g_fifoDlWriteCalls;
         WriteDisplayListData(val, sizeBytes);
         return;
     }
-    {   // NO100F diagnostic: the last 96 raw pipe writes, dumped when the parser meets a zero-count draw.
+    if (PipeRingEnabled()) {   // NO100F diagnostic: the last raw pipe writes, dumped when the parser meets a zero-count draw.
         g_pipeRing[g_pipeRingPos % kPipeRing] = {val, sizeBytes, RecompMod::CurrentTranslatedExecutionAddress()};
         ++g_pipeRingPos;
     }
@@ -519,6 +643,7 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
         g_hleGxState.fifoByteCount += count;
     };
 
+    bool inParseLoop = false;  // phasetime: true only around the parse loop below, never in the vertex loop
     auto consumeBytes = [&](uint32_t count, u32& out) -> bool {
         if (count == 0 || g_hleGxState.fifoByteCount < count) return false;
         u32 value = 0;
@@ -533,13 +658,54 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
             g_hleGxState.fifoReadOffset = 0;
         }
         out = value;
+        // phasetime: stamp the first packet of the parse loop (per present interval).
+        if (inParseLoop && PhaseTimeArmed() &&
+            g_phaseFirstPacketNanos.load(std::memory_order_relaxed) == 0) {
+            g_phaseFirstPacketNanos.store(
+                static_cast<uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count()),
+                std::memory_order_relaxed);
+        }
         return true;
     };
 
     pushBytes(val, sizeBytes == 0 ? 4 : sizeBytes);
 
+    // fifofast: a raw draw packet is still filling; nothing to parse until it is whole.
+    if (g_pendingRawPacketBytes != 0) {
+        const uint8_t* head = fifoData();
+        const bool same = !g_hleGxState.inBegin && g_hleGxState.fifoByteCount >= 3 &&
+                          head[0] == g_pendingRawHeader[0] && head[1] == g_pendingRawHeader[1] &&
+                          head[2] == g_pendingRawHeader[2];
+        if (!same) {
+            g_pendingRawPacketBytes = 0;  // the buffer moved on under us: the slow path decides
+        } else if (g_hleGxState.fifoByteCount < g_pendingRawPacketBytes) {
+            if (FifoFastMode() == 2) {
+                // what the slow path would wait for now
+                uint32_t rawVertexSize = 0;
+                const GXVtxFmt fmt = static_cast<GXVtxFmt>(head[0] & GX_VAT_MASK_CMD);
+                const uint32_t slowBytes = TryGetRawDirectFifoVertexSize(fmt, rawVertexSize)
+                                               ? 3u + static_cast<uint32_t>(ReadBE16(head + 1)) * rawVertexSize
+                                               : 0u;
+                if (slowBytes != g_pendingRawPacketBytes) {
+                    if (g_fifoFastMismatches++ == 0) {
+                        RT_LOGF(RT_TAG_GX, "[gxfifo] fifofast mismatch: cached packet %u bytes, slow path now %u (cmd 0x%02X)\n",
+                                g_pendingRawPacketBytes, slowBytes, head[0]);
+                    }
+                    g_pendingRawPacketBytes = 0;
+                }
+            }
+            if (g_pendingRawPacketBytes != 0) {
+                ++g_fifoFastWords;
+                return;  // the slow path would break at the same size check
+            }
+        } else {
+            g_pendingRawPacketBytes = 0;  // whole now: parse it below
+        }
+    }
+
     // Parse raw FIFO command packets written directly to the gather pipe
     // (e.g. NW4R/G3D paths that do not call the GXBegin wrapper function).
+    inParseLoop = true;
     while (!g_hleGxState.inBegin) {
         if (g_hleGxState.fifoByteCount < 1) {
             break;
@@ -646,6 +812,10 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
             if (TryGetRawDirectFifoVertexSize(vtxFmt, rawVertexSize)) {
                 const uint32_t packetBytes = 3u + static_cast<uint32_t>(vtxCount) * rawVertexSize;
                 if (g_hleGxState.fifoByteCount < packetBytes) {
+                    if (FifoFastMode() != 0) {  // fifofast: wait for the rest without parsing
+                        g_pendingRawPacketBytes = packetBytes;
+                        std::memcpy(g_pendingRawHeader, data, 3);
+                    }
                     break;
                 }
                 if (TrySubmitRawDirectFifoDraw(data, packetBytes, prim, vtxFmt, vtxCount)) {
@@ -668,6 +838,7 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
         // Unknown FIFO command byte outside a begin packet; discard it so stream parsing can recover.
         if (!consumeBytes(1, sink)) break;
     }
+    inParseLoop = false;
 
     if (!g_hleGxState.inBegin) {
         return;
@@ -933,6 +1104,8 @@ extern "C" void GX_HLE_FIFO_WriteBurst(const uint8_t* data, uint32_t sizeBytes) 
     if (data == nullptr || sizeBytes == 0) {
         return;
     }
+    ++g_fifoBurstCalls;
+    g_fifoBurstBytes += sizeBytes;
 
     if (IsDisplayListActive() && WriteDisplayListBurst(data, sizeBytes)) {
         return;

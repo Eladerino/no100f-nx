@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include "gx_internal.h"
 #include "runtime_log.h"
 
@@ -118,7 +119,15 @@ extern "C" void GX__SetCopyClamp_8016f618(uint32_t c) {
 }
 PPC_NATIVE_OVERRIDE_VOID(800FE944, GX__SetCopyClamp_8016f618, (uint32_t c), (c));
 
+// Guest bounding-box clear/read counts (60 fps campaign instruments, PHASE1-DESK section 1.4): how
+// often the game arms and reads the box, counted where the guest actually calls them.
+static std::atomic<uint64_t> s_gxBBoxClears{0};
+static std::atomic<uint64_t> s_gxBBoxReads{0};
+uint64_t GxBBoxClearCount() { return s_gxBBoxClears.load(std::memory_order_relaxed); }
+uint64_t GxBBoxReadCount() { return s_gxBBoxReads.load(std::memory_order_relaxed); }
+
 extern "C" void GX__ClearBoundingBox_8016fecc() {
+    s_gxBBoxClears.fetch_add(1, std::memory_order_relaxed);
     GxBBoxClear();
     GXClearBoundingBox();
     try {
@@ -130,6 +139,7 @@ PPC_NATIVE_OVERRIDE_VOID(800ff040, GX__ClearBoundingBox_8016fecc, (), ());
 
 // GXReadBoundingBox (this SDK's order: left, top, right, bottom).
 extern "C" void GX__ReadBoundingBox_Gc(uint32_t leftPtr, uint32_t topPtr, uint32_t rightPtr, uint32_t bottomPtr) {
+    s_gxBBoxReads.fetch_add(1, std::memory_order_relaxed);
     uint16_t l = 0, t = 0, r = 0, b = 0;
     GxBBoxRead(l, t, r, b);
     {   // union with Aurora's CPU-projected box, which also sees display-list and FIFO draws

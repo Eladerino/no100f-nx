@@ -276,6 +276,30 @@ uint64_t OsHleInternal::NextAlarmTicks()
     return fireTime > base ? fireTime - base : 0;
 }
 
+// tracecnt sampler support (hle/vi.cpp, declared in hle_stubs.h): the alarm queue head,
+// its fire time and the current system time, read with the same TryRead32 pattern as
+// NextAlarmTicks above. Host-side read only: never fires, unlinks or sanitizes the queue.
+// Returns false when the queue is empty or unreadable.
+bool OS_HLE_TraceAlarmHead(uint32_t* head, uint64_t* fireTime, uint64_t* now)
+{
+    if (!head || !fireTime || !now) {
+        return false;
+    }
+    const uint32_t queueBase = RuntimeConfig::SDA1_BASE - kAlarmQueueOffsetFromR13;
+    uint32_t h = 0;
+    uint32_t fireHi = 0;
+    uint32_t fireLo = 0;
+    if (!::Memory::TryRead32(queueBase, h) || h == 0 ||
+        !::Memory::TryRead32(h + kAlarmFireTimeHiOffset, fireHi) ||
+        !::Memory::TryRead32(h + kAlarmFireTimeLoOffset, fireLo)) {
+        return false;
+    }
+    *head = h;
+    *fireTime = (static_cast<uint64_t>(fireHi) << 32) | fireLo;
+    *now = ReadSystemTime();
+    return true;
+}
+
 extern "C" void OSSetAlarm_HLE_801a0870(CpuContext* ctx)
 {
     CpuContext* cpu = ctx ? ctx : &GetPersistentCpuContext();

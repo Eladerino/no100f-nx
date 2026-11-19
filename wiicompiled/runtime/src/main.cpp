@@ -101,6 +101,10 @@ bool OS_HLE_InterruptsEnabled() noexcept;
 #if defined(__SWITCH__)
 // switch/source/fw_switch_init.cpp: the host stack, as offsets into the NRO's ELF.
 extern "C" size_t fw_switch_host_backtrace(char* out, size_t size, unsigned skip);
+// switch/source/fw_debug_server.cpp: performs a debug-server boot requested by
+// userAppInit (which runs before the static constructors, so it cannot boot the
+// server itself). No-op when no boot was requested.
+extern "C" void fw_debug_server_boot_pending(void);
 #endif
 
 namespace {
@@ -1395,6 +1399,13 @@ int RuntimeMain(int argc, char** argv) {
     InstallPosixMemoryFaultHandler();
 #endif
     InitializeProcessTranscript(argc, argv);
+#if defined(__SWITCH__)
+    // The debug server (dev builds): userAppInit only requested this boot,
+    // because it runs before the static constructors and the server's C++
+    // globals do not exist there (no100f-nx crash-2). Main is running now, so
+    // they do. No-op when no boot was requested (server off, sockets off).
+    fw_debug_server_boot_pending();
+#endif
     std::signal(SIGABRT, AbortSignalHandler);
     // Install exit/terminate handlers to ensure we get crash info
     std::atexit(AtExitHandler);
@@ -1511,7 +1522,12 @@ int RuntimeMain(int argc, char** argv) {
             RuntimeConfigFile::ForceAspect169Enabled()      ? DisplaySettings::kAspect16x9
             : !RuntimeConfigFile::WidescreenEnabled(true) ? DisplaySettings::kAspect4x3
                                                           : DisplaySettings::kAspectFill);
+#if defined(__SWITCH__)
+        // Switch: 720p internal by default (runtime_config.h writes the same into a fresh Config.toml).
+        displaySettings.renderScale = RuntimeConfigFile::ResolutionMultiplier(1.5f);
+#else
         displaySettings.renderScale = RuntimeConfigFile::ResolutionMultiplier(2.25f);  // 1080p
+#endif
         DisplaySettings::Initialize(displaySettings);
         const bool configWidescreen = DisplaySettings::GameWidescreen();
         auroraConfig.windowWidth = configWidescreen ? 854 : 640;

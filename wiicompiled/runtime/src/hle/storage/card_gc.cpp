@@ -10,6 +10,8 @@
 
 #include <dolphin/card.h>
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -201,11 +203,26 @@ extern "C" int32_t CARDFormatAsync_Gc(int32_t chan, uint32_t callback) {
 }
 PPC_NATIVE_OVERRIDE(8000140C, CARDFormatAsync_Gc, int32_t, (int32_t c, uint32_t cb), (c, cb));
 
+// CARDOpen calls and the time spent in them (Aurora's lookup and its "Failed to open file" log line
+// on a miss) since start, for hle/vi.cpp's frame lines: the game probes its save names (ScoobyDoo01-07)
+// from game code, so their cost lands in the frame.
+static std::atomic<uint64_t> g_cardOpenCalls{0}, g_cardOpenNanos{0};
+void CardOpenTotals(uint64_t* calls, uint64_t* nanos) {
+    *calls = g_cardOpenCalls.load(std::memory_order_relaxed);
+    *nanos = g_cardOpenNanos.load(std::memory_order_relaxed);
+}
+
 extern "C" int32_t CARDOpen_Gc(int32_t chan, uint32_t fileName, uint32_t fileInfo) {
+    const auto t0 = std::chrono::steady_clock::now();
     EnsureCardInit();
     CARDFileInfo fi{};
     const s32 r = Trace(("CARDOpen " + GuestString(fileName)).c_str(), FileResult(chan, CARDOpen(chan, GuestString(fileName).c_str(), &fi)));
     if (r >= 0 && fileInfo) StoreFileInfo(fileInfo, fi);
+    g_cardOpenCalls.fetch_add(1, std::memory_order_relaxed);
+    g_cardOpenNanos.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                        std::chrono::steady_clock::now() - t0)
+                                                        .count()),
+                              std::memory_order_relaxed);
     return r;
 }
 PPC_NATIVE_OVERRIDE(801357A4, CARDOpen_Gc, int32_t, (int32_t c, uint32_t n, uint32_t f), (c, n, f));

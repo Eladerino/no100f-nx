@@ -520,6 +520,13 @@ else()
     target_compile_options(no100f_model_culling_tests PRIVATE -UNDEBUG)
 endif()
 add_test(NAME no100f_model_culling_tests COMMAND no100f_model_culling_tests)
+
+add_executable(no100f_libm_bindings_tests "${CMAKE_CURRENT_LIST_DIR}/tests/no100f_libm_bindings_tests.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/hle/no100f_libm_hle.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/hle/c_stdio.cpp")
+target_include_directories(no100f_libm_bindings_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include" "${CMAKE_CURRENT_LIST_DIR}/src")
+target_compile_features(no100f_libm_bindings_tests PRIVATE cxx_std_17)
+add_test(NAME no100f_libm_bindings_tests COMMAND no100f_libm_bindings_tests)
 add_executable(no100f_resources_tests "${CMAKE_CURRENT_LIST_DIR}/tests/no100f_resources_tests.cpp")
 target_include_directories(no100f_resources_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
 target_compile_features(no100f_resources_tests PRIVATE cxx_std_17)

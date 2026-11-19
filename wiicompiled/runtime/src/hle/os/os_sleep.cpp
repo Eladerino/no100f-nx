@@ -407,6 +407,17 @@ void ReportUnparkableSleep(uint32_t queuePtr, uint32_t thread)
 }
 } // namespace
 
+// seam-wake fire total (the [seamwake] fire counter in OSSleepThread
+// below). File scope since the durability build (DRAIN-DURABILITY-STUDY
+// Q4) so the Fix 2 present hook's health line in hle/vi.cpp can read it
+// through OS_HLE_SeamWakeFires(); the seam pass increments it exactly
+// where it always did.
+static uint32_t s_seamWakeFires = 0;
+uint32_t OS_HLE_SeamWakeFires()
+{
+    return s_seamWakeFires;
+}
+
 // OSSleepThread (0x801b5c90)
 // Puts the current thread to sleep on a specified wait queue.
 extern "C" void OSSleepThread_HLE_801aa9b8(CpuContext* ctx)
@@ -470,6 +481,134 @@ extern "C" void OSSleepThread_HLE_801aa9b8(CpuContext* ctx)
         // Mark fiber as waiting
         if (Fiber::GuestFiberManager::IsInitialized()) {
             Fiber::GuestFiberManager::SuspendGuestThread(currentThread);
+        }
+
+        // tracewake (park seam trace, Nov 16, 2026; PARK-STUDY.md Q4(d)): the thread
+        // is linked into the queue and about to suspend. One line per park on the
+        // display-sync queue, with the sync snapshot and the guest retrace count
+        // at park time: a park whose snapshot diff is already out of the wait set
+        // {-1, 2} is a park on a stale latch - the lost-wakeup signature when it
+        // follows a wake-to-empty line flagged inrestore=1.
+        if (OS_HLE_TraceWakeArmed() && queuePtr == kTraceWakeQueueAddr) {
+            static int sleepN = 0;
+            if (sleepN++ < 100000) {
+                const TraceWakeSync snap = OS_HLE_TraceWakeReadSync();
+                RT_LOGF(RT_TAG_OS,
+                        "[wake] sleep q=0x%08X thr=0x%08X lr=0x%08X A=%u B=%u arm=%u latch=%u guest=%u d4=%u b8=%u e0=%u flag=%u\n",
+                        queuePtr, currentThread, cpu->lr,
+                        snap.counterA, snap.counterB, snap.arm, snap.latch, snap.guest,
+                        snap.d4, snap.b8, snap.e0, snap.flag);
+            }
+        }
+
+        // seamfix (SEAMFIX-DESIGN.md element 1): deliver-after-link. The
+        // thread is linked into its wait queue (state WAITING, queue word
+        // set) but SelectThread has not run, so run the scheduler idle
+        // pump's delivery set once, here, on the sleeper's context: the held
+        // GX PE-interrupt class, due alarms + the general callback drain,
+        // then due retraces. A delivery that wakes this thread - its
+        // completion was already queued when it slept - pops it through
+        // WakeupThreadQueue; the SelectThread tail below then re-selects
+        // it through the normal path and the sleep returns instead of
+        // suspending. That is the position the hardware interrupt occupies
+        // when it lands after the link, and it is what the convicted
+        // display-sync park (parkwatch's target) can never produce for
+        // itself once the only submitter has slept. The pass runs inside
+        // the deferred-callback scope: a delivered callback that blocks
+        // busy-returns (SchedulerCanSwitchAway above), WakeupThreadQueue's
+        // immediate reschedule no-ops, so no fiber switch can occur inside
+        // the pass. The sleeper's register file is saved and restored, so
+        // the pass is invisible in its context either way. Sleep timers
+        // and the audio poll are deliberately excluded: resuming other
+        // sleepers re-enters SelectThread mid-pass, and feeder manufacture
+        // is the stall service's domain, not the park seam's. Inert unless
+        // SCOOBY_SEAMFIX is set.
+        if (OS_HLE_SeamFixArmed() && !DetClock::Enabled() &&
+            !VI_HLE_IsAdvancingRetrace() && !OS_HLE_InRestoreDelivery() &&
+            currentThread != kIdleThreadContextAddr) {
+            const uint32_t guestBefore = OS_HLE_TraceWakeReadSync().guest;
+            const CpuContext savedCpu = *cpu;
+            OS_HLE_BeginDeferredGuestCallbacks();
+            const bool gxDelivered = DvdProcessPendingGxCallbacks(cpu);
+            const bool alarmDelivered = OsHleInternal::ProcessAlarmQueue(cpu, 8);
+            VI_HLE_PollRetrace(cpu);
+            OS_HLE_EndDeferredGuestCallbacks();
+            *cpu = savedCpu;
+            const bool woke =
+                ::Memory::Read16(currentThread + kThreadStateOffset) != kThreadStateWaiting ||
+                ::Memory::Read32(currentThread + kThreadQueueOffset) != queuePtr;
+            static uint32_t seamPasses = 0;
+            static uint32_t seamWakes = 0;
+            if (woke) {
+                ++seamWakes;
+            }
+            if (gxDelivered || alarmDelivered ||
+                OS_HLE_TraceWakeReadSync().guest != guestBefore || woke) {
+                ++seamPasses;
+                if (seamPasses <= 100000) {
+                    RT_LOGF(RT_TAG_OS,
+                            "[seamfix] post-link delivery q=0x%08X thr=0x%08X gx=%d alarm=%d retrace=%u->%u woke=%d\n",
+                            queuePtr, currentThread, gxDelivered ? 1 : 0,
+                            alarmDelivered ? 1 : 0, guestBefore,
+                            OS_HLE_TraceWakeReadSync().guest, woke ? 1 : 0);
+                }
+                if (woke) {
+                    RT_LOGF(RT_TAG_OS,
+                            "[seamfix] woke thr=0x%08X on q=0x%08X (post-link delivery #%u; state=%u queue=0x%08X)\n",
+                            currentThread, queuePtr, seamWakes,
+                            static_cast<unsigned>(::Memory::Read16(currentThread + kThreadStateOffset)),
+                            ::Memory::Read32(currentThread + kThreadQueueOffset));
+                }
+            }
+
+            // seam-wake (CLIFF-STUDY.md Q4 rank 1): the delivery pass above
+            // can strand the display-sync gate with either half charged -
+            // the draw-done half delivered into AA4's token-match exit
+            // (arm set, no advancer run), or the retrace half spent by
+            // BB0's unconditional latch clear one retrace before the arm
+            // landed - because the two halves are charged in different
+            // passes and every producer of the missing half is downstream
+            // of the advancer, whose trigger supply is then dead. No
+            // delivery can repair that state: the held deque is empty
+            // and the gate is guest memory, not a queued item. But the
+            // waiter's post-sleep path presents unconditionally
+            // (PARK-STUDY-2.md Q3), so one targeted wake while the thread
+            // is still linked restarts the chain from either stranded
+            // sub-state - parkwatch's proven actuation (714/714 and
+            // 151/151 fires across two boots) moved into the pass, at
+            // delivery speed instead of the detector's ~2 s cadence.
+            // Scoped exactly: this queue only, the sleeper still linked
+            // on it after the delivery steps (a delivery wake above
+            // already unlinked it - never fire twice), and the sync
+            // snapshot reading pipeline-full ((B - A) mod 3 == 2, the
+            // waiter's own legitimate-sleep condition). Any other state
+            // is not this defect and does not fire. Armed with seamfix
+            // (this whole pass is); the [seamwake] line carries the
+            // snapshot and the outcome so a fire off pipeline-full, or
+            // one the log shows was not followed by frame resumption,
+            // is loud (the study's falsifier). The SelectThread tail
+            // below re-selects the woken thread through the normal path.
+            if (queuePtr == kTraceWakeQueueAddr &&
+                ::Memory::Read16(currentThread + kThreadStateOffset) == kThreadStateWaiting &&
+                ::Memory::Read32(currentThread + kThreadQueueOffset) == queuePtr) {
+                const TraceWakeSync snap = OS_HLE_TraceWakeReadSync();
+                const int32_t diff = static_cast<int32_t>(snap.counterB) -
+                                     static_cast<int32_t>(snap.counterA);
+                if (((diff % 3) + 3) % 3 == 2) {
+                    OS_HLE_WakeupThreadNoReschedule(cpu, queuePtr);
+                    const bool seamWoke =
+                        ::Memory::Read16(currentThread + kThreadStateOffset) != kThreadStateWaiting ||
+                        ::Memory::Read32(currentThread + kThreadQueueOffset) != queuePtr;
+                    ++s_seamWakeFires;
+                    if (s_seamWakeFires <= 100000) {
+                        RT_LOGF(RT_TAG_OS,
+                                "[seamwake] fire #%u q=0x%08X thr=0x%08X A=%u B=%u arm=%u latch=%u guest=%u result=%s\n",
+                                s_seamWakeFires, queuePtr, currentThread,
+                                snap.counterA, snap.counterB, snap.arm, snap.latch,
+                                snap.guest, seamWoke ? "woke" : "still-linked");
+                    }
+                }
+            }
         }
 
         // Set reschedule flag and switch threads

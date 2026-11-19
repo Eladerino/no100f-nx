@@ -62,6 +62,20 @@ void VI_HLE_ProcessRetracesDeferred(int maxToProcess);  // hle/vi.cpp
 extern "C" void OS_HLE_ProcessAlarmsDeferred(int maxToProcess);  // hle/os/os_alarm.cpp
 void Audio_HLE_PollDeferred();                           // hle/audio/audio.cpp
 
+// tracewake (park seam trace, Nov 16, 2026; PARK-STUDY.md Q4(d)): depth of
+// DeliverPendingInterruptsOnEnable on this host thread. Maintained only when
+// SCOOBY_TRACE_WAKE is set (read once, at the delivery entry below); read back
+// through OS_HLE_InRestoreDelivery() by the OSWakeupThread seam logger in
+// os_scheduler.cpp to flag wakes that execute inside a restore-time delivery -
+// the lost-wakeup seam PARK-STUDY.md Q3 names. Bookkeeping only: no delivery
+// path reads it, and with the env unset the counter never moves.
+static thread_local int g_restoreDeliveryDepth = 0;
+
+bool OS_HLE_InRestoreDelivery()
+{
+    return g_restoreDeliveryDepth > 0;
+}
+
 // NO100F busy-waits on counters its AX frame callback advances (sound fades before a level load) with
 // nothing in the loop but OSDisableInterrupts/OSRestoreInterrupts. On hardware the pending interrupts are
 // taken the moment interrupts are re-enabled, so deliver due VI/alarm/audio work here (at most every 1 ms).
@@ -75,14 +89,18 @@ static void DeliverPendingInterruptsOnEnable()
     if (now - lastUs.load(std::memory_order_relaxed) < 1000) return;
     lastUs.store(now, std::memory_order_relaxed);
     inside = true;
+    static const bool traceWake = std::getenv("SCOOBY_TRACE_WAKE") != nullptr;
+    if (traceWake) ++g_restoreDeliveryDepth;
     try {
         VI_HLE_ProcessRetracesDeferred(1);
         OS_HLE_ProcessAlarmsDeferred(4);
         Audio_HLE_PollDeferred();
     } catch (...) {
+        if (traceWake) --g_restoreDeliveryDepth;
         inside = false;
         throw;
     }
+    if (traceWake) --g_restoreDeliveryDepth;
     inside = false;
 }
 

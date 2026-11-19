@@ -1,5 +1,6 @@
 extern "C" void aurora_gx_vtx_state(uint8_t* desc26, uint8_t* fmt8x26x3);
 #include "gx_internal.h"
+#include "no100f_native_scene.h"
 #include "runtime_log.h"
 #include "gx_stream_common.h"
 #include "gx_cp_decode.h"
@@ -1196,6 +1197,45 @@ static void ApplyAuroraVtxAttrFmtForDisplayList(GXVtxFmt fmt, bool mixed) {
     ApplyAuroraVtxAttrFmtAll();
 }
 
+// Native-scene Stage 1: if this list is the pinned prop's learned display
+// list, submit the cached host geometry natively at this exact stream
+// position instead of the guest stream (no100f_native_scene.cpp). The native
+// direct layout is published straight into Aurora, bypassing the HLE applied
+// mirrors; afterwards the applied state is invalidated and the list's own
+// state re-applied, so the next list sees exactly what it would have seen.
+static bool No100fNativeSceneTryConvertDl(uint32_t listAddr, uint32_t nbytes, GXVtxFmt dlVtxFmt,
+                                          bool dlVtxFmtMixed) {
+    const uint8_t* packed = nullptr;
+    uint32_t packedBytes = 0;
+    uint16_t packedCount = 0;
+    if (!No100fNativeSceneTryGetPacked(listAddr, nbytes, &packed, &packedBytes, &packedCount)) {
+        return false;
+    }
+    EnsureAuroraFrameActive();
+    for (int attr = 0; attr < 26; ++attr) {
+        if (attr == GX_VA_NBT) continue;
+        GXAttrType type = GX_NONE;
+        if (attr == GX_VA_POS || attr == GX_VA_NRM || attr == GX_VA_CLR0 || attr == GX_VA_TEX0) {
+            type = GX_DIRECT;
+        }
+        GXSetVtxDesc(static_cast<GXAttr>(attr), type);
+    }
+    GXSetVtxAttrFmt(GX_VTXFMT7, GX_VA_POS, GX_POS_XYZ, GX_F32, 0);
+    GXSetVtxAttrFmt(GX_VTXFMT7, GX_VA_NRM, GX_NRM_XYZ, GX_F32, 0);
+    GXSetVtxAttrFmt(GX_VTXFMT7, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
+    GXSetVtxAttrFmt(GX_VTXFMT7, GX_VA_TEX0, GX_TEX_ST, GX_F32, 0);
+    const bool ok = aurora::gx::fifo::submit_raw_draw(GX_TRIANGLESTRIP, GX_VTXFMT7, packed,
+                                                      packedCount, packedBytes);
+    InvalidateAppliedAuroraState();
+    ApplyAuroraVtxDesc();
+    ApplyAuroraVtxAttrFmtForDisplayList(dlVtxFmt, dlVtxFmtMixed);
+    if (ok) {
+        GXMarkFrameWork();
+        No100fNativeSceneCountNativeDraw();
+    }
+    return ok;
+}
+
 static void SubmitLytDrawPacket(const uint8_t* packet, uint32_t packetBytes) {
     if (packet == nullptr || packetBytes == 0) {
         return;
@@ -1334,6 +1374,8 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
         if (const uint8_t* hostDl = nullptr; true) {
             uint32_t hostSize = 0;
             if (GxHostDisplayList(list, nbytes, hostDl, hostSize)) {
+                // N2 DL census: host-served stub — submission denominator only.
+                No100fDlCensusNoteHostServed(listAddr, nbytes);
                 s_skipNext = s_skipId >= 0 && ((uint32_t(list[8]) << 24) | (uint32_t(list[9]) << 16) | (uint32_t(list[10]) << 8) | list[11]) == uint32_t(s_skipId);
                 g_boundTexMaps.fill(BoundTexInfo{});
                 EnsureAuroraFrameActive();
@@ -1382,6 +1424,8 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
         const bool mayContainDraw = auroraList ? false
             : (cached != nullptr) ? cached->mayContainDraw : DisplayListMayContainDraw(list, nbytes);
         if (!mayContainDraw) {
+            // N2 DL census: register-only submission (denominator only).
+            No100fDlCensusAccumulate(listAddr, nbytes, false, 0);
             EnsureAuroraFrameActive();
             GXMarkFrameWork();
             GXCallDisplayList(list, nbytes);
@@ -1502,6 +1546,17 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
             }
         }
 
+        // N2 DL census: the scan's maxIdx is final here on both the cached
+        // and uncached paths. Vertices = the largest index count over the
+        // indexed attributes (maxIdx+1); direct-mode draws contribute 0.
+        {
+            uint32_t dlVerts = 0;
+            for (size_t a = 0; a < maxIdx.size(); ++a) {
+                if (sawIdx[a] && maxIdx[a] + 1u > dlVerts) dlVerts = maxIdx[a] + 1u;
+            }
+            No100fDlCensusAccumulate(listAddr, nbytes, true, dlVerts);
+        }
+
         if (needsFlatten) {
             bool flattenApplyOk = flattenOk && scanOk && auroraStream != nullptr && auroraStreamBytes != 0;
             if (flattenApplyOk) {
@@ -1514,6 +1569,9 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                 flattenApplyOk = flattenArraysOk && flattenXfOk;
             }
             if (flattenApplyOk) {
+                if (No100fNativeSceneTryConvertDl(listAddr, nbytes, dlVtxFmt, dlVtxFmtMixed)) {
+                    return;
+                }
                 EnsureAuroraFrameActive();
                 GXMarkFrameWork();
                 GXCallDisplayList(auroraStream, auroraStreamBytes);
@@ -1534,6 +1592,9 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
                 applyOk = arraysOk && xfOk;
             }
             if (applyOk) {
+                if (No100fNativeSceneTryConvertDl(listAddr, nbytes, dlVtxFmt, dlVtxFmtMixed)) {
+                    return;
+                }
                 EnsureAuroraFrameActive();
                 GXMarkFrameWork();
                 GXCallDisplayList(list, nbytes);

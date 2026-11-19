@@ -29,6 +29,13 @@
 #include <string>
 #include <thread>
 
+// Time the guest thread spent in JoinMix waiting for the mix worker (mix_worker = true), since start.
+// hle/vi.cpp's frame lines report it per frame.
+static std::atomic<uint64_t> g_axMixJoinNanos{0};
+static std::atomic<uint64_t> g_axMixJoinWaits{0};
+uint64_t AxMixJoinNanosTotal() { return g_axMixJoinNanos.load(std::memory_order_relaxed); }
+uint64_t AxMixJoinWaitsTotal() { return g_axMixJoinWaits.load(std::memory_order_relaxed); }
+
 namespace AxDspHle {
 namespace {
 
@@ -116,7 +123,15 @@ public:
     void JoinMix() {
         if (m_mixThread.joinable()) {
             std::unique_lock<std::mutex> lock(m_mixMutex);
-            m_mixIdle.wait(lock, [this] { return !m_mixPending && !m_mixBusy; });
+            if (m_mixPending || m_mixBusy) {  // timed only when it really waits
+                const auto t0 = std::chrono::steady_clock::now();
+                m_mixIdle.wait(lock, [this] { return !m_mixPending && !m_mixBusy; });
+                g_axMixJoinNanos.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                                     std::chrono::steady_clock::now() - t0)
+                                                                     .count()),
+                                           std::memory_order_relaxed);
+                g_axMixJoinWaits.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         PublishAuxOutputs();
     }

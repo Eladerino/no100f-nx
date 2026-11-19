@@ -288,6 +288,14 @@ PPC_NATIVE_OVERRIDE_VOID(8000139C, PPCMtpmc4_8012e5e0, (), ());
 
 extern "C" uint32_t PPCMfhid2_8012e630_impl()
 {
+    // NO100F measuring instrument (Nov 15, 2026): the fifofast boot-1 profile charged 24.1% of
+    // game-thread samples to this address. Count the calls and log a milestone every million,
+    // so one route boot separates real execution from profiler attribution.
+    static std::atomic<uint64_t> s_mfhid2Calls{0};
+    const uint64_t callNo = s_mfhid2Calls.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (callNo % 1000000 == 0) {
+        RT_LOG(RT_TAG_OS) << "mfhid2 calls: " << callNo << std::endl;
+    }
     if (CpuContext* cpu = TryGetCpuContext()) {
         if (cpu->hid2 == 0) {
             cpu->hid2 = 0x10000000u;

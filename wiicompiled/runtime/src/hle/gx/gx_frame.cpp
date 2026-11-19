@@ -64,18 +64,36 @@ void WriteDisplayListData(uint32_t val, uint32_t sizeBytes) {
     }
 }
 
+// Time the game thread spent here waiting for Aurora to accept a new frame (the 1 ms sleeps between
+// BeginAuroraFrame attempts, i.e. the frame pipeline behind it not ready yet), since start, for
+// hle/vi.cpp's frame lines: it is a wait, not guest work. Game thread only.
+static uint64_t g_beginFrameWaitNanos = 0, g_beginFrameWaitSleeps = 0;
+void GxBeginFrameWaitTotals(uint64_t* nanos, uint64_t* sleeps) {
+    *nanos = g_beginFrameWaitNanos;
+    *sleeps = g_beginFrameWaitSleeps;
+}
+
 void BeginNextAuroraFrameWithRetry(std::chrono::milliseconds timeout) {
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + timeout;
     uint32_t attempts = 0;
     while (std::chrono::steady_clock::now() < deadline) {
         UpdateAuroraAndProcessEvents();
         ++attempts;
         if (BeginAuroraFrame()) {
             g_auroraFrameActive.store(true, std::memory_order_release);
+            if (attempts > 1) {
+                g_beginFrameWaitNanos += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+                        .count());
+            }
             return;
         }
+        ++g_beginFrameWaitSleeps;
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    g_beginFrameWaitNanos += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
     // Retry window expired: the aurora frame stays INACTIVE and every GX
     // command until the next EnsureAuroraFrameActive is silently dropped
     // (draws, one-shot bakes, copies). This is a frame-loss event.

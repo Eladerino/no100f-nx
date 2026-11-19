@@ -368,7 +368,13 @@ inline void EnsureConfigFile() {
               "widescreen = true\n"
               "force_16_9 = false\n"
               "# render height = 480 x resolution_multiplier: 1.5 = 720p, 2.25 = 1080p, 4.5 = 4K, 0 = screen size\n"
+#if defined(__SWITCH__)
+              // Switch: 720p internal. At 2.25 the console's GPU alone takes ~42 ms a frame in the
+              // Mystic Manor (deko3d timestamps, Nov 14 2026), above the 33 ms of 30 fps.
+              "resolution_multiplier = 1.5\n"
+#else
               "resolution_multiplier = 2.25\n"
+#endif
               "# 0 (off), 120 or 180; only with fps60 = true, it stays off at 30 fps\n"
               "frame_interpolation_fps = 0\n"
               "# true = 60 fps (the game times itself by the clock, so it keeps its speed)\n"

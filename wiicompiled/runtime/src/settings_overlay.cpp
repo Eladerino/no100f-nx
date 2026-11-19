@@ -102,7 +102,11 @@ AuroraHdrCalibration g_hdrCalibrationFrame{};
 bool g_exitPromptOpen = false;
 bool g_rumbleEnabled = RuntimeConfigFile::RumbleEnabled(true);
 int g_controllerPort = 0;
+#if defined(__SWITCH__)
+float g_resolutionScale = RuntimeConfigFile::ResolutionMultiplier(1.5f);  // main.cpp's Switch default (720p)
+#else
 float g_resolutionScale = RuntimeConfigFile::ResolutionMultiplier(2.25f);  // main.cpp's default (1080p)
+#endif
 int g_audioVolumePercent = static_cast<int>(std::lround(RuntimeConfigFile::AudioVolume(1.0f) * 100.0f));
 int g_musicVolumePercent = static_cast<int>(std::lround(RuntimeConfigFile::MusicVolume(1.0f) * 100.0f));
 int g_soundEffectsVolumePercent =
@@ -190,11 +194,19 @@ constexpr std::array<std::string_view, 3> kDisplayModeConfigNames = {
 };
 
 // Render heights: 1x is 480 lines in every aspect (DisplaySettings), the width follows the aspect.
+#if defined(__SWITCH__)
+// Switch: up to the TV's 1080p. Anything above it only costs frames.
+constexpr std::array<ResolutionItem, 6> kResolutions = {{
+    {"Auto (screen size)", 0.0f}, {"0.5x (240p)", 0.5f}, {"0.75x (360p)", 0.75f}, {"1x (480p)", 1.0f},
+    {"1.5x (720p)", 1.5f}, {"2.25x (1080p)", 2.25f},
+}};
+#else
 constexpr std::array<ResolutionItem, 12> kResolutions = {{
     {"Auto (screen size)", 0.0f}, {"0.5x (240p)", 0.5f}, {"0.75x (360p)", 0.75f}, {"1x (480p)", 1.0f},
     {"1.5x (720p)", 1.5f}, {"2x (960p)", 2.0f}, {"2.25x (1080p)", 2.25f}, {"3x (1440p)", 3.0f},
     {"4x (1920p)", 4.0f}, {"4.5x (4K)", 4.5f}, {"6x (2880p)", 6.0f}, {"8x (3840p)", 8.0f},
 }};
+#endif
 
 struct AspectItem {
     const char* label;
@@ -861,7 +873,11 @@ void DrawGamepadSettings(uint32_t selectedGamePort);
 void DrawControllerSettings() {
     using namespace OverlayTheme;
     SectionTitle("Controls");
+#if defined(__SWITCH__)
+    Hint("Every connected controller plays as Scooby (player 1).");
+#else
     Hint("Every connected gamepad controls Scooby (player 1), mapped for its type. The keyboard works at the same time.");
+#endif
     for (int port = 0; port < PAD_MAX_CONTROLLERS; ++port) {
         const std::string label = "Port " + std::to_string(port + 1);
         ImGui::RadioButton(label.c_str(), &g_controllerPort, port);
@@ -869,6 +885,11 @@ void DrawControllerSettings() {
             ImGui::SameLine();
         }
     }
+#if defined(__SWITCH__)
+    // No keyboard or mouse on Switch: the gamepad section is the whole page.
+    ImGui::Separator();
+    DrawGamepadSettings(static_cast<uint32_t>(g_controllerPort));
+#else
     static bool keyboardSection = false;
     const ImVec2 plank(Px(270), Px(40));
     if (Plank("GAMEPAD##controls", !keyboardSection, plank)) keyboardSection = false;
@@ -881,6 +902,7 @@ void DrawControllerSettings() {
     } else {
         DrawGamepadSettings(selectedGamePort);
     }
+#endif
 }
 
 void DrawGamepadSettings(uint32_t selectedGamePort) {
@@ -925,8 +947,10 @@ void DrawGamepadSettings(uint32_t selectedGamePort) {
         }
     }
     ImGui::Separator();
+#if !defined(__SWITCH__)  // Joy-Con and Pro Controllers are always known pads, and there are no Wii Remotes
     controller_mapping_wizard::DrawSetupList();
     DrawWiiRemoteSettings(selectedGamePort);
+#endif
     DrawRumbleSettings();  // above the mapping, and shown with no controller connected too
     if (controllerCount == 0) {
         return;
@@ -1139,6 +1163,7 @@ void DrawAudioSettings() {
         AudioBackend::Instance().SetMuted(g_audioMuted);
         RuntimeConfigFile::SetAudioMuted(g_audioMuted);
     }
+#if !defined(__SWITCH__)  // a keyboard shortcut, and other apps' media: neither exists on Switch
     DrawKeyBinding("Mute shortcut (click, then press a key)", g_muteHotkey, RebindKind::MuteHotkey, 0, Px(160));
     if (Toggle("Mute game music while other media plays", &g_attenuateMusicWhenMediaPlays)) {
         MusicAttenuation::SetEnabled(g_attenuateMusicWhenMediaPlays);
@@ -1166,6 +1191,7 @@ void DrawAudioSettings() {
             Hint("No external media is currently playing.");
         }
     }
+#endif
 
     SectionTitle("Advanced");
     if (Toggle("Mix audio on a worker thread", &g_audioMixWorker)) {
@@ -1391,6 +1417,7 @@ void DrawVideoSettings() {
         Hint("Switching between 4:3 and widescreen takes effect after a restart.");
     }
 
+#if !defined(__SWITCH__)  // Switch: no window, display mode or monitor
     static constexpr const char* kDisplayModes[] = {
         "Window",
         "Borderless fullscreen",
@@ -1463,6 +1490,7 @@ void DrawVideoSettings() {
         Hint("Used when the game goes fullscreen (F11 or Display mode).");
     }
 #endif
+#endif  // !__SWITCH__
 #ifdef AURORA_HAS_INK_OUTLINES
     {
         const int level = std::clamp(RuntimeConfigFile::InkOutlines(), 0, 2);
@@ -1583,6 +1611,9 @@ void DrawVideoSettings() {
 
 #if defined(AURORA_HAS_SCENE_STAGE) || defined(AURORA_HAS_BLOOM)
     SectionTitle("Experimental");
+#endif
+#if defined(__SWITCH__)
+    Hint("Untested on Switch: these may cost frames or not show up yet.");
 #endif
 #ifdef AURORA_HAS_SCENE_STAGE
     {
@@ -1872,26 +1903,40 @@ void CopyScreenshotToClipboard(std::filesystem::path file, void* owner) {
 
 // The settings board (F10): on the left a column of Resume, the pages as planks and Quit Game, the page's settings on
 // the right, and the keys + build ID at the bottom. With a controller: A opens a page, B goes back, LB / RB change the page.
-enum class Page { Video, Audio, Controls, LanPlay, About };
+enum class Page { Video, Audio, Controls, LanPlay, Cheats, About };
 struct PageItem {
     Page page;
     const char* label;
 };
+#if defined(__SWITCH__)
+// Switch: Cheats joins the list (the dev menu's edits; there is no keyboard for F8 here).
+constexpr std::array<PageItem, 6> kPages = {{
+    {Page::Video, "Video"}, {Page::Audio, "Audio"}, {Page::Controls, "Controls"}, {Page::LanPlay, "LAN Play"},
+    {Page::Cheats, "Cheats"}, {Page::About, "About"},
+}};
+#else
 constexpr std::array<PageItem, 5> kPages = {{
     {Page::Video, "Video"}, {Page::Audio, "Audio"}, {Page::Controls, "Controls"}, {Page::LanPlay, "LAN Play"},
     {Page::About, "About"},
 }};
+#endif
 Page g_page = Page::Video;
 
 void DrawAboutPage() {
     using namespace OverlayTheme;
     SectionTitle("FrightWorks: Night of 100 Frights");
     ImGui::TextUnformatted(no100f_credits::Line().c_str());
+#if defined(__SWITCH__)
+    Hint("A Switch build of the FrightWorks port of Scooby-Doo! Night of 100 Frights (GameCube). "
+         "It runs your own copy of the game.");
+    ImGui::TextDisabled("%s", kProjectUrl);
+#else
     Hint("A native PC port of Scooby-Doo! Night of 100 Frights (GameCube), built on WiiCompiled and Aurora. "
          "It runs your own copy of the game.");
     if (ImGui::Button("Open the project page (F1)")) {
         if (!SDL_OpenURL(kProjectUrl)) ShowNotice(std::string("Couldn't open ") + kProjectUrl);
     }
+#endif
     SectionTitle("This build");
     ImGui::Text("Version %s", BuildInfo::Version());
     if (!BuildInfo::Release() && BuildInfo::Commit()[0] != '\0') {
@@ -1902,6 +1947,15 @@ void DrawAboutPage() {
         Hint("A test build: mention this line when you report a bug.");
     }
     ImGui::TextDisabled("Graphics API: %s", GraphicsApiDisplayName());
+#if defined(__SWITCH__)
+    SectionTitle("Buttons");
+    const std::array<std::pair<const char*, const char*>, 4> keys = {{
+        {"Hold -", "Settings (this board) / back to the game"},
+        {"A / B", "A opens a page, B goes back to the page list, then back to the game"},
+        {"L / R", "Change the page here"},
+        {"Capture", "Screenshot (the console's own)"},
+    }};
+#else
     if (no100f_devmenu::Enabled()) {
         ImGui::TextColored(Vec(Colour::Lime), "Developer tools are on: F8 opens the dev menu, F3 records a video.");
     }
@@ -1925,6 +1979,7 @@ void DrawAboutPage() {
         {"A / B", "With a controller: A opens a page, B goes back to the page list, then back to the game"},
         {"LB / RB", "Change the page here with a controller"},
     }};
+#endif
     if (ImGui::BeginTable("##keys", 2, ImGuiTableFlags_SizingFixedFit)) {
         for (const auto& [key, what] : keys) {
             ImGui::TableNextRow();
@@ -1949,6 +2004,7 @@ void DrawPage(Page page) {
         DrawRebindPrompt();
         break;
     case Page::LanPlay: DrawLanPlaySettings(); break;
+    case Page::Cheats: no100f_devmenu::DrawCheats(); break;
     case Page::About: DrawAboutPage(); break;
     }
 }
@@ -2117,12 +2173,20 @@ void DrawTopBar() {
         ImGui::PushFont(Small());
         ImGui::SetCursorPosY(ImGui::GetCursorPosY() + Px(6));
         const float footerY = ImGui::GetCursorPosY();
+#if defined(__SWITCH__)
+        const size_t firstKey = 0;
+        const std::array<std::pair<const char*, const char*>, 3> footerKeys = {{
+            {onTabs ? "A / B" : "B", onTabs ? "open / close" : "back to pages"},
+            {"Hold -", "back to the game"}, {"L / R", "page"},
+        }};
+#else
         const size_t firstKey = (ImGui::GetIO().BackendFlags & ImGuiBackendFlags_HasGamepad) != 0 ? 0 : 1;
         const std::array<std::pair<const char*, const char*>, 6> footerKeys = {{
             {onTabs ? "A / B" : "B", onTabs ? "open / close" : "back to pages"},
             {"Esc / F10 / Back", "back to the game"}, {"LB / RB", "page"}, {"F2", "screenshot"}, {"F11", "fullscreen"},
             {"F1", "project page"},
         }};
+#endif
         for (size_t i = firstKey; i < footerKeys.size(); ++i) {
             // A small window leaves out the last ones: the About page lists them all.
             const float keyWidth = ImGui::CalcTextSize(footerKeys[i].first).x + Px(5) + ImGui::CalcTextSize(footerKeys[i].second).x;
@@ -2688,6 +2752,13 @@ void DrawHotkeyGuide() {
         return row;
     };
     GuideCard keys;
+#if defined(__SWITCH__)
+    // No keyboard: one card, the controller's, with the hold of - that opens the board.
+    (void)key;
+    (void)dev;
+    keys.title = "Controller";
+    keys.rows = {GuideRow{"Hold -", "Settings and cheats", true, {}}};
+#else
     keys.title = "Hotkeys";
     keys.rows = {key("F10 / Esc", "Settings", {"f10", "escape"}), key("F11", "Fullscreen or window", {"f11"}),
                  key("F2", "Screenshot", {"f2"}), key("F1", "Project page", {"f1"})};
@@ -2695,12 +2766,14 @@ void DrawHotkeyGuide() {
         keys.rows.push_back(key("F8", "Dev menu", {"f8"}));
         keys.rows.push_back(key("F3", "Record a video", {"f3"}));
     }
+#endif
     MeasureCard(keys);
 
-    char folderBuffer[1024] = {};
-    const size_t folderLength = aurora_get_button_icon_folder(folderBuffer, sizeof(folderBuffer));
     GuideCard pad;
     pad.title = "Controller";
+#if !defined(__SWITCH__)  // Switch: the one card above already says it
+    char folderBuffer[1024] = {};
+    const size_t folderLength = aurora_get_button_icon_folder(folderBuffer, sizeof(folderBuffer));
     if (folderLength > 0 && folderLength < sizeof(folderBuffer)) {
         const std::string folder(folderBuffer, folderLength);
         if (!BackButtonBound()) pad.rows.push_back({BackLabel(folder), "Settings", true, {LoadButtonIcon(folder, "back")}});
@@ -2709,6 +2782,7 @@ void DrawHotkeyGuide() {
                                 {LoadButtonIcon(folder, "left_shoulder")}});
         }
     }
+#endif
     if (!pad.rows.empty()) MeasureCard(pad);
 
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
@@ -2808,6 +2882,11 @@ void Draw() noexcept {
     // Wait for the frame worker's DONE phase: it has replayed the previous frame's ImGui draw lists
     // and started the next ImGui frame, so all overlay callers can now safely issue ImGui commands.
     aurora_wait_for_frame_worker();
+#if defined(__SWITCH__)
+    // Nintendo layout: SDL names buttons by position, so the printed A (right) is East, which ImGui reads as Cancel.
+    // Swapping makes A confirm and B go back on the board and every other ImGui window.
+    ImGui::GetIO().ConfigNavSwapGamepadButtons = true;
+#endif
     g_hdrCalibrationFrame = {};
     // Also drive the Wii Remote rescan from here: PADRead runs it too, but this
     // runs once per presented frame whatever the game is doing (e.g. sitting in

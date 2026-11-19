@@ -44,6 +44,11 @@ extern "C" void GxNotifyGuestRamDmaWrite(uint32_t addr, uint32_t size);
 #include <sstream>
 #include <deque>
 #include <utility>
+#if defined(__SWITCH__)
+#include <array>
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -122,10 +127,114 @@ FileBytes CachedFile(const fs::path& path) {
     return it != g_readCache.end() ? it->second : nullptr;
 }
 
+#if defined(__SWITCH__)
+// The Switch: disc files stay open. DvdReadContract::ReadExact opens an ifstream per read, which on
+// Horizon is an fs open, a timestamp query, a size query, the read and a close: five IPCs to the fs
+// service per DVD read (15.6% of the game thread during the Bink intro in a profile, Nov 14 2026).
+// Here the last 8 files read keep a descriptor and their size (taken once, at open: the game's files
+// do not change while it runs), so a read is a seek (no IPC: fsdev keeps the offset) and one fs read.
+// Same failure contract as ReadExact. All open files close at exit.
+namespace {
+struct OpenDiscFile {
+    std::string path;
+    int fd = -1;
+    uint64_t size = 0;
+    uint64_t lastUse = 0;
+};
+constexpr size_t kOpenDiscFiles = 8;
+std::mutex g_openDiscFilesMutex;
+std::array<OpenDiscFile, kOpenDiscFiles> g_openDiscFiles;
+uint64_t g_openDiscFilesClock = 0;
+
+void CloseOpenDiscFiles() {
+    std::lock_guard<std::mutex> lock(g_openDiscFilesMutex);
+    for (auto& f : g_openDiscFiles) {
+        if (f.fd >= 0) ::close(f.fd);
+        f = OpenDiscFile{};
+    }
+}
+
+// Reads into `dst` (length bytes) directly: guest RAM for the DVD DMA paths, or a vector's storage.
+bool ReadDiscFileInto(const fs::path& hostPath, uint64_t offset, uint32_t length, uint8_t* dst,
+                      DvdReadContract::HostReadFailure& failure) {
+    failure = DvdReadContract::HostReadFailure::None;
+    const std::string path = hostPath.string();
+    std::lock_guard<std::mutex> lock(g_openDiscFilesMutex);
+    OpenDiscFile* file = nullptr;
+    for (auto& f : g_openDiscFiles) {
+        if (f.fd >= 0 && f.path == path) {
+            file = &f;
+            break;
+        }
+    }
+    if (file == nullptr) {
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) {
+            failure = DvdReadContract::HostReadFailure::MissingFile;
+            return false;
+        }
+        const off_t end = ::lseek(fd, 0, SEEK_END);
+        if (end < 0) {
+            ::close(fd);
+            failure = DvdReadContract::HostReadFailure::BadOffset;
+            return false;
+        }
+        // the least recently used slot (an empty one first)
+        file = &g_openDiscFiles[0];
+        for (auto& f : g_openDiscFiles) {
+            if (f.fd < 0) {
+                file = &f;
+                break;
+            }
+            if (f.lastUse < file->lastUse) file = &f;
+        }
+        if (file->fd >= 0) ::close(file->fd);
+        static std::once_flag s_atExit;
+        std::call_once(s_atExit, [] { std::atexit(&CloseOpenDiscFiles); });
+        *file = OpenDiscFile{path, fd, static_cast<uint64_t>(end), 0};
+    }
+    file->lastUse = ++g_openDiscFilesClock;
+    if (offset >= file->size) {
+        failure = DvdReadContract::HostReadFailure::BadOffset;
+        return false;
+    }
+    if (static_cast<uint64_t>(length) > file->size - offset) {
+        failure = DvdReadContract::HostReadFailure::ShortRead;
+        return false;
+    }
+    if (::lseek(file->fd, static_cast<off_t>(offset), SEEK_SET) < 0) {
+        failure = DvdReadContract::HostReadFailure::BadOffset;
+        return false;
+    }
+    size_t got = 0;
+    while (got < length) {
+        const ssize_t n = ::read(file->fd, dst + got, length - got);
+        if (n <= 0) {
+            failure = DvdReadContract::HostReadFailure::ShortRead;
+            return false;
+        }
+        got += static_cast<size_t>(n);
+    }
+    return true;
+}
+
+bool ReadDiscFileOpen(const fs::path& hostPath, uint64_t offset, uint32_t length, std::vector<uint8_t>& destination,
+                      DvdReadContract::HostReadFailure& failure) {
+    std::vector<uint8_t> staged(length);
+    if (!ReadDiscFileInto(hostPath, offset, length, staged.data(), failure)) return false;
+    destination = std::move(staged);
+    return true;
+}
+}  // namespace
+#endif
+
 bool ReadHostFile(const fs::path& path, uint64_t offset, uint32_t length, std::vector<uint8_t>& destination,
                   DvdReadContract::HostReadFailure& failure) {
     const auto start = std::chrono::steady_clock::now();
     bool ok = false;
+#if defined(__SWITCH__)
+    ok = ReadDiscFileOpen(path, offset, length, destination, failure);
+#else
     if (const FileBytes bytes = CachedFile(path)) {
         failure = DvdReadContract::HostReadFailure::None;
         if (offset >= bytes->size()) {
@@ -140,6 +249,7 @@ bool ReadHostFile(const fs::path& path, uint64_t offset, uint32_t length, std::v
     } else {
         ok = DvdReadContract::ReadExact(path, offset, length, destination, failure);
     }
+#endif
     g_dvdReadNanos.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                                        std::chrono::steady_clock::now() - start)
                                                        .count()),
@@ -216,11 +326,61 @@ extern "C" uint32_t g_dvdFstReservedBase;
 extern "C" uint32_t g_dvdFstReservedSize;
 
 // Byte-wise copy into guest RAM plus the DMA notification the GX caches need.
+#if defined(__SWITCH__)
+// The guest RAM behind [dest, dest + size) as one host range, or null: then the byte-wise
+// Memory::Write8 path below runs instead. A DMA into an executable range goes the byte-wise way too, so
+// RecompMod's executable-write guard sees it exactly as before (it reports or allows per range).
+static uint8_t* GuestDmaTarget(uint32_t dest, size_t size) {
+    if (size == 0 || size > UINT32_MAX) return nullptr;
+    try {
+        if (RecompMod::HandleExecutableWrite(dest, size, 0)) return nullptr;
+        return Memory::GetPointer(dest, size);
+    } catch (const Memory::AccessViolation&) {
+        return nullptr;
+    }
+}
+#endif
+
 static void CopyToGuestAsDma(uint32_t dest, const uint8_t* data, size_t size) {
+#if defined(__SWITCH__)
+    // One memcpy instead of a checked Memory::Write8 per byte (the "DVDLowRead" share of the route
+    // profile, Nov 14 2026).
+    if (uint8_t* host = GuestDmaTarget(dest, size)) {
+        std::memcpy(host, data, size);
+        GxNotifyGuestRamDmaWrite(dest, static_cast<uint32_t>(size));
+        return;
+    }
+#endif
     for (size_t i = 0; i < size; ++i) {
         Memory::Write8(dest + static_cast<uint32_t>(i), data[i]);
     }
     GxNotifyGuestRamDmaWrite(dest, static_cast<uint32_t>(size));
+}
+
+// A DVD read straight into guest RAM where it is one host range (the Switch: no staging vector, no
+// second copy), else through ReadHostFile and CopyToGuestAsDma. Same failure contract as ReadHostFile;
+// the range was checked against the file's size before any byte moves, so a failure here is an I/O
+// error, which the callers treat as fatal (the destination may then hold part of the read, as a
+// failed DMA would).
+static bool ReadHostFileToGuest(const fs::path& path, uint64_t offset, uint32_t length, uint32_t dest,
+                                DvdReadContract::HostReadFailure& failure) {
+#if defined(__SWITCH__)
+    if (uint8_t* host = GuestDmaTarget(dest, length)) {
+        const auto start = std::chrono::steady_clock::now();
+        const bool ok = ReadDiscFileInto(path, offset, length, host, failure);
+        g_dvdReadNanos.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                           std::chrono::steady_clock::now() - start)
+                                                           .count()),
+                                 std::memory_order_relaxed);
+        g_dvdReads.fetch_add(1, std::memory_order_relaxed);
+        if (ok) GxNotifyGuestRamDmaWrite(dest, length);
+        return ok;
+    }
+#endif
+    std::vector<uint8_t> tempBuf;
+    if (!ReadHostFile(path, offset, length, tempBuf, failure)) return false;
+    CopyToGuestAsDma(dest, tempBuf.data(), tempBuf.size());
+    return true;
 }
 
 // Host path strings only ever leave this module as UTF-8 display text.
@@ -302,11 +462,19 @@ static fs::path ResolveDvdMappedHostPath(const std::string& dvdPath, const fs::p
 struct PendingDvdCallback { uint32_t callbackPtr; int32_t result; uint32_t commandBlock; };
 static std::mutex g_pendingDvdCallbackMutex;
 static std::deque<PendingDvdCallback> g_pendingDvdCallbacks;
+// Stall-service feeder (hle/vi.cpp): counts every call to QueueDvdCallback below, the
+// choke point all DVD/CARD async completions queue through (CARD via QueueGuestCallback).
+// A guest busy-waiting without queueing work leaves this frozen; the stall service only
+// drains the queue and never calls QueueDvdCallback, so before an episode's first firing
+// any movement here is guest-caused. Read host-side through Dvd_HLE_TraceEnqueues.
+static std::atomic<uint32_t> g_traceEnqueues{0};
 static void QueueDvdCallback(uint32_t callbackPtr, int32_t result, uint32_t commandBlock) {
+    g_traceEnqueues.fetch_add(1, std::memory_order_relaxed);
     static const bool trace = std::getenv("SCOOBY_TRACE_IO") != nullptr;  // diagnostic: async completions
     if (trace) {
         static int n = 0;
-        if (n++ < 400) RT_LOGF(RT_TAG_DVD, "[io] queue cb 0x%08X (r3=0x%08X r4=0x%08X)\n", callbackPtr,
+        // Caps raised to 100000 Nov 16, 2026: the first trace boot saturated the 400-line cap in the front-end (FMV stream reader), leaving the junction invisible.
+        if (n++ < 100000) RT_LOGF(RT_TAG_DVD, "[io] queue cb 0x%08X (r3=0x%08X r4=0x%08X)\n", callbackPtr,
                                static_cast<uint32_t>(result), commandBlock);
     }
     if (callbackPtr == 0) return;
@@ -317,9 +485,77 @@ static void QueueDvdCallback(uint32_t callbackPtr, int32_t result, uint32_t comm
 void QueueGuestCallback(uint32_t callbackPtr, uint32_t r3, uint32_t r4) {
     QueueDvdCallback(callbackPtr, static_cast<int32_t>(r3), r4);
 }
+
+// seamfix (SEAMFIX-DESIGN.md element 2): the GX PE-interrupt callback class -
+// the token callback, the draw-done callback and the GX finish-queue wake
+// queued from RaisePeInterruptForBp (hle/gx/gx_fifo.cpp) - is HELD here
+// instead of joining the general drain, and delivered only at
+// interrupt-shaped points (the OSSleepThread seam pass and the scheduler
+// idle pump, via DvdProcessPendingGxCallbacks below). Rationale: on hardware
+// the draw-done interrupt lands asynchronously, after the display-sync
+// waiter has linked into its sleep queue; the eager drain delivered it
+// before the link and spent its advance/wake on an awake waiter, which is
+// the convicted display-sync park. Unarmed (no SCOOBY_SEAMFIX) the entries
+// take the general deque exactly as before. The enqueue accounting
+// (g_traceEnqueues, the [io] queue line) is identical on both paths, so the
+// stall service's enqueue feeder and traceio readouts do not change.
+static std::mutex g_pendingGxCallbackMutex;
+static std::deque<PendingDvdCallback> g_pendingGxCallbacks;
+// Follow-up instrument (SEAMFIX-FOLLOWUP-STUDY): high-water mark of the held GX
+// deque, updated under the deque mutex on the armed push path below and read
+// host-side via Dvd_HLE_GxHeldHighWater by the tracecnt sampler in hle/vi.cpp.
+static std::atomic<uint32_t> g_gxHeldHighWater{0};
+// Drain-at-retrace (RETRACE-HALF-STUDY R5): boot-total of callbacks actually
+// delivered by DvdProcessPendingGxCallbacks below (registry-miss drops
+// excluded), read host-side via Dvd_HLE_GxDeliveredTotal by the retrace drain
+// in hle/vi.cpp, which diffs it across its own drain call to count what that
+// call delivered. Maintained unconditionally; touches no guest state.
+static std::atomic<uint32_t> g_gxDeliveredTotal{0};
+void QueueGxInterruptCallback(uint32_t callbackPtr, uint32_t r3, uint32_t r4) {
+    if (!OS_HLE_SeamFixArmed()) {
+        QueueDvdCallback(callbackPtr, static_cast<int32_t>(r3), r4);
+        return;
+    }
+    g_traceEnqueues.fetch_add(1, std::memory_order_relaxed);
+    static const bool trace = std::getenv("SCOOBY_TRACE_IO") != nullptr;
+    if (trace) {
+        static int n = 0;
+        if (n++ < 100000) RT_LOGF(RT_TAG_DVD, "[io] queue cb 0x%08X (r3=0x%08X r4=0x%08X)\n", callbackPtr, r3, r4);
+    }
+    if (callbackPtr == 0) return;
+    std::lock_guard<std::mutex> lock(g_pendingGxCallbackMutex);
+    g_pendingGxCallbacks.push_back({callbackPtr, static_cast<int32_t>(r3), r4});
+    const uint32_t depthNow = static_cast<uint32_t>(g_pendingGxCallbacks.size());
+    if (depthNow > g_gxHeldHighWater.load(std::memory_order_relaxed))
+        g_gxHeldHighWater.store(depthNow, std::memory_order_relaxed);
+}
+
+// Stall-service feeder accessor (declared in hle_stubs.h): relaxed load of the enqueue
+// counter above. No state is touched.
+uint32_t Dvd_HLE_TraceEnqueues() {
+    return g_traceEnqueues.load(std::memory_order_relaxed);
+}
+uint32_t Dvd_HLE_GxHeldHighWater() {
+    return g_gxHeldHighWater.load(std::memory_order_relaxed);
+}
+uint32_t Dvd_HLE_GxPendingCount() {
+    std::lock_guard<std::mutex> lock(g_pendingGxCallbackMutex);
+    return static_cast<uint32_t>(g_pendingGxCallbacks.size());
+}
+uint32_t Dvd_HLE_GxDeliveredTotal() {
+    return g_gxDeliveredTotal.load(std::memory_order_relaxed);
+}
+// Wedge hunt, Nov 16, 2026: drain-side SCOOBY_TRACE_IO lines (early-return / deliver / DROP); trace only, env-gated, no behaviour change.
 bool DvdProcessPendingCallbacks(CpuContext* cpu) {
+    static const bool trace = std::getenv("SCOOBY_TRACE_IO") != nullptr;  // diagnostic: async completions
     static thread_local int depth = 0;
-    if (depth != 0) return false;   // a callback that queues another read drains on the outer loop
+    if (depth != 0) {
+        if (trace) {
+            static int earlyN = 0;
+            if (earlyN++ < 100000) RT_LOGF(RT_TAG_DVD, "[io] drain early-return depth=%d\n", depth);
+        }
+        return false;   // a callback that queues another read drains on the outer loop
+    }
     ++depth;
     bool any = false;
     for (;;) {
@@ -331,7 +567,66 @@ bool DvdProcessPendingCallbacks(CpuContext* cpu) {
             g_pendingDvdCallbacks.pop_front();
         }
         any = true;
-        if (!TranslatedFunctionRegistry::FindByAddressPtr(cb.callbackPtr)) continue;
+        if (!TranslatedFunctionRegistry::FindByAddressPtr(cb.callbackPtr)) {
+            if (trace) {
+                static int dropN = 0;
+                if (dropN++ < 100000) RT_LOGF(RT_TAG_DVD, "[io] drain DROP cb 0x%08X (registry miss)\n", cb.callbackPtr);
+            }
+            continue;
+        }
+        if (trace) {
+            static int deliverN = 0;
+            if (deliverN++ < 100000) RT_LOGF(RT_TAG_DVD, "[io] drain deliver cb 0x%08X\n", cb.callbackPtr);
+        }
+        CpuContext callbackCpu = cpu ? *cpu : GetPersistentCpuContext();
+        callbackCpu.gpr[3] = static_cast<uint32_t>(cb.result);
+        callbackCpu.gpr[4] = cb.commandBlock;
+        CpuContextScope scope(&callbackCpu);
+        InvokeIndirectCpu(cb.callbackPtr, &callbackCpu);
+    }
+    --depth;
+    return any;
+}
+
+// seamfix: drain the held GX PE-interrupt class (see QueueGxInterruptCallback
+// above). Same delivery discipline as the general drain - FIFO until empty,
+// nested calls defer to the outer loop, callbacks invoked on a copy of the
+// caller's context, [io] trace lines in the same format - but a separate
+// deque and depth guard, reached only from the OSSleepThread seam pass and
+// the scheduler idle pump.
+bool DvdProcessPendingGxCallbacks(CpuContext* cpu) {
+    static const bool trace = std::getenv("SCOOBY_TRACE_IO") != nullptr;
+    static thread_local int depth = 0;
+    if (depth != 0) {
+        if (trace) {
+            static int earlyN = 0;
+            if (earlyN++ < 100000) RT_LOGF(RT_TAG_DVD, "[io] drain early-return depth=%d\n", depth);
+        }
+        return false;
+    }
+    ++depth;
+    bool any = false;
+    for (;;) {
+        PendingDvdCallback cb{};
+        {
+            std::lock_guard<std::mutex> lock(g_pendingGxCallbackMutex);
+            if (g_pendingGxCallbacks.empty()) break;
+            cb = g_pendingGxCallbacks.front();
+            g_pendingGxCallbacks.pop_front();
+        }
+        any = true;
+        if (!TranslatedFunctionRegistry::FindByAddressPtr(cb.callbackPtr)) {
+            if (trace) {
+                static int dropN = 0;
+                if (dropN++ < 100000) RT_LOGF(RT_TAG_DVD, "[io] drain DROP cb 0x%08X (registry miss)\n", cb.callbackPtr);
+            }
+            continue;
+        }
+        if (trace) {
+            static int deliverN = 0;
+            if (deliverN++ < 100000) RT_LOGF(RT_TAG_DVD, "[io] drain deliver cb 0x%08X\n", cb.callbackPtr);
+        }
+        g_gxDeliveredTotal.fetch_add(1, std::memory_order_relaxed);
         CpuContext callbackCpu = cpu ? *cpu : GetPersistentCpuContext();
         callbackCpu.gpr[3] = static_cast<uint32_t>(cb.result);
         callbackCpu.gpr[4] = cb.commandBlock;
@@ -1368,19 +1663,12 @@ extern "C" int32_t DVDLowRead_80166330(uint32_t buffer, uint32_t length, uint32_
         return finish(false);
     }
 
-    std::vector<uint8_t> tempBuf;
     DvdReadContract::HostReadFailure failure;
-    if (!ReadHostFile(readInfo.entry->hostPath,
-                                    readInfo.fileOffset,
-                                    readInfo.readLength,
-                                    tempBuf,
-                                    failure)) {
+    if (!ReadHostFileToGuest(readInfo.entry->hostPath, readInfo.fileOffset, readInfo.readLength, buffer, failure)) {
         ReportDvdReadError(HostPathText(readInfo.entry->hostPath), readInfo.fileOffset,
                            readInfo.readLength, DvdReadContract::Describe(failure));
         return finish(false);
     }
-
-    CopyToGuestAsDma(buffer, tempBuf.data(), tempBuf.size());
     return finish(true);
 }
 PPC_NATIVE_OVERRIDE(8010E2EC, DVDLowRead_80166330, int32_t, (uint32_t b, uint32_t l, uint32_t o, uint32_t c), (b, l, o, c));
