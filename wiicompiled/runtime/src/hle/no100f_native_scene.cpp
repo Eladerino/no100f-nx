@@ -178,6 +178,14 @@ std::atomic<uint32_t> g_digestUnavailable{0};
 std::atomic<uint32_t> g_digestChangedLogged{0};
 // N3b (§3.5): DLs whose array staging was skipped at a submission site.
 std::atomic<uint32_t> g_stagingSkipped{0};
+// L5 (nsauto) counters; see No100fNsAutoEnabled.
+constexpr size_t kNsAutoMaxGeometries = 1024;  // bound on auto-admitted caches per boot
+std::atomic<uint32_t> g_nsAutoAdmitted{0};      // geometries admitted by the structural pin
+std::atomic<uint32_t> g_nsAutoPinReject{0};     // non-allowlisted atomics failing the structural pin
+std::atomic<uint32_t> g_nsAutoCapReject{0};     // admissions refused by kNsAutoMaxGeometries
+std::atomic<uint64_t> g_nsAutoViewReject{0};    // learns/converts refused by the array-identity check
+std::atomic<uint64_t> g_nsAutoConverted{0};     // conversions served for auto-admitted geometries
+
 
 // N8 C5: per-geometry recurrence (see N8-COUNTER-BUILD-LOG.md). The conversion
 // site cannot attribute uncatalogued DLs to geometries (TryGetPacked resolves
@@ -468,6 +476,16 @@ void PrintCounters(const char* why) {
                      static_cast<unsigned long long>(g_n9SitePostCalls.load()));
         std::fflush(stderr);
     }
+    // L5: auto-admit counters, printed only while nsauto is on (so the
+    // existing line shapes are unchanged for every other flight).
+    if (std::getenv("NO100F_NSAUTO") != nullptr) {
+        std::fprintf(stderr,
+                     "[nsauto] %s admitted=%u pin_reject=%u cap_reject=%u view_reject=%llu converted=%llu\n",
+                     why, g_nsAutoAdmitted.load(), g_nsAutoPinReject.load(), g_nsAutoCapReject.load(),
+                     static_cast<unsigned long long>(g_nsAutoViewReject.load()),
+                     static_cast<unsigned long long>(g_nsAutoConverted.load()));
+        std::fflush(stderr);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -572,6 +590,7 @@ struct Cache {
     uint32_t numVertices = 0;
     uint32_t meshCount = 0;
     uint32_t arms = 0;  // arms served (per-arm draw-count log cadence)
+    bool autoAdmitted = false;  // L5: admitted by the structural pin, not the allowlist
     std::vector<MeshCache> meshes;
 };
 
@@ -634,6 +653,10 @@ void ClearDlIndexForGeometry(uint32_t geom) {
     }
 }
 std::vector<uint32_t> g_boundGeometries;    // first-binding audit log (per pointer)
+// L5: membership set for g_boundGeometries. With nsauto the bound list grows
+// to hundreds of geometries and ArmBegin runs per atomic render, so the old
+// linear std::find per arm would cost real time; the vector keeps the order.
+std::unordered_set<uint32_t> g_boundSet;
 std::vector<uint32_t> g_engagedGeometries;  // engaged line printed once per geometry
 std::vector<std::pair<uint32_t, uint32_t>> g_extraDlSeen;  // first-sighting lines, capped at 16
 bool g_censusOverflowLogged = false;
@@ -1096,6 +1119,31 @@ bool No100fNativeSceneEnabled() {
     return enabled;
 }
 
+// L5 (Seam-A grown allowlist, done structurally): dk_diag key "nsauto" ->
+// NO100F_NSAUTO. With it on (and nativescene on), an atomic whose geometry is
+// NOT in kAllowlist is still admitted when it passes the structural pin: one
+// morph target, material count == mesh-header mesh count, mesh count within
+// the parse cap, and a readable mesh[0] texture name. The parse validation
+// battery and the per-mesh checks then decide exactly as they do for
+// allowlisted rows, and the conversion site adds the array-identity check
+// (No100fDlArrayView) so a mesh that draws from any buffer other than its own
+// RpGeometry arrays (skinning, CPU morphing) stays on GX. Default off.
+// Read once, silent (the toggle flight's one-[nativescene]-line check holds);
+// the state shows on the [dk] diag line and the [nsauto] counter line.
+static bool No100fNsAutoEnabled() {
+    static const bool enabled = std::getenv("NO100F_NSAUTO") != nullptr;
+    return enabled;
+}
+
+// L5: the array-identity check. GXSetArray bases are compared as physical
+// addresses (the SDK masks the virtual pointer the same way).
+static bool NsAutoViewMatches(const Cache& c, const No100fDlArrayView* view) {
+    if (view == nullptr || !view->descExact) return false;
+    const auto same = [](uint32_t a, uint32_t b) { return ((a ^ b) & 0x3FFFFFFFu) == 0; };
+    return same(view->pos, c.positions) && same(view->nrm, c.normals) &&
+           same(view->clr0, c.colours) && same(view->tex0, c.uv);
+}
+
 bool No100fNativeSceneArmBegin(uint32_t atomic) {
     if (!No100fNativeSceneEnabled()) return false;
     No100fN9ScopeTimer n9(g_n9ArmBeginNs, g_n9ArmBeginCalls);
@@ -1117,12 +1165,26 @@ bool No100fNativeSceneArmBegin(uint32_t atomic) {
     if (!geom || !Memory::Contains(geom, 0x70)) return false;
     const AllowlistRow* row =
         FindAllowlistRow(Memory::Read32(geom + 0x10), Memory::Read32(geom + 0x14));
-    if (row == nullptr) {
+    if (row == nullptr && !No100fNsAutoEnabled()) {
         return false;  // not admitted: silent, this is every other atomic
     }
-    if (Memory::Read32(geom + 0x18) != 1 || Memory::Read32(geom + 0x24) != row->meshCount) {
-        CountFallback(kFbPinStructure);
-        return false;
+    if (row != nullptr) {
+        if (Memory::Read32(geom + 0x18) != 1 || Memory::Read32(geom + 0x24) != row->meshCount) {
+            CountFallback(kFbPinStructure);
+            return false;
+        }
+    } else {
+        // L5 structural pin (the allowlist row's structure test with the
+        // expected mesh count taken from the mesh header itself).
+        const uint32_t meshHeader = Memory::Read32(geom + 0x60);
+        const uint32_t headerMeshes = (meshHeader && Memory::Contains(meshHeader, 16))
+                                          ? ReadGuest16(meshHeader + 4)
+                                          : 0;
+        if (Memory::Read32(geom + 0x18) != 1 || headerMeshes == 0 || headerMeshes > kMaxMeshes ||
+            Memory::Read32(geom + 0x24) != headerMeshes) {
+            g_nsAutoPinReject.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
     }
     // N5 (a): pin work ends at the mutex.
     if (n9On) {
@@ -1149,11 +1211,11 @@ bool No100fNativeSceneArmBegin(uint32_t atomic) {
         // the full pin gets its own cache entry and learned DL. The first
         // binding per pointer is logged so bindings stay auditable; there
         // is no boot-fatal ambiguity state.
-        if (std::find(g_boundGeometries.begin(), g_boundGeometries.end(), geom) ==
-            g_boundGeometries.end()) {
+        if (g_boundSet.insert(geom).second) {
             g_boundGeometries.push_back(geom);
-            std::fprintf(stderr, "[nativescene] bound geom=%08X tex=\"%s\" (binding #%zu)\n",
-                         geom, row->names[0], g_boundGeometries.size());
+            std::fprintf(stderr, "[nativescene] bound geom=%08X tex=\"%s\" (binding #%zu)%s\n",
+                         geom, row ? row->names[0] : "(auto)", g_boundGeometries.size(),
+                         row ? "" : " auto");
             std::fflush(stderr);
         }
         const auto boundIt = g_caches.find(geom);
@@ -1165,7 +1227,19 @@ bool No100fNativeSceneArmBegin(uint32_t atomic) {
             No100fN9ScopeTimer nameT(g_n9ArmNameNs, g_n9ArmNameCalls);
             pinNameOk = ReadTextureNameViaMesh(geom, pinName);
         }
-        if (!pinNameOk || pinName != row->names[0]) {
+        if (row == nullptr && !pinNameOk) {
+            // L5: auto admission needs a readable name (the identity check
+            // below compares it against the cached parse); not poisoned, the
+            // name may become readable later.
+            g_nsAutoPinReject.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (row == nullptr && boundIt == g_caches.end() &&
+            g_nsAutoAdmitted.load(std::memory_order_relaxed) >= kNsAutoMaxGeometries) {
+            g_nsAutoCapReject.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (row != nullptr && (!pinNameOk || pinName != row->names[0])) {
             CountFallback(kFbNameMismatch);
             std::fprintf(stderr,
                          "[nativescene] name_mismatch geom=%08X expected=\"%s\" actual=\"%s\"; "
@@ -1187,6 +1261,13 @@ bool No100fNativeSceneArmBegin(uint32_t atomic) {
             cacheOk = EnsureCacheLocked(atomic, geom, row);
         }
         if (!cacheOk) return false;
+        if (row == nullptr) {
+            Cache& admitted = g_caches[geom];
+            if (!admitted.autoAdmitted) {
+                admitted.autoAdmitted = true;
+                g_nsAutoAdmitted.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
         std::string nowName;
         const auto entryIt = g_caches.find(geom);
         // N5 (b): second name walk. Hoisted out of the condition to time
@@ -1458,7 +1539,7 @@ void No100fNativeSceneCountStagingSkipped() {
 bool No100fNativeSceneTryGetPacked(uint32_t listAddr, uint32_t nbytes, uint32_t dlVerts,
                                    uint64_t dlDigest, bool dlDigestValid,
                                    const uint8_t** outData, uint32_t* outBytes,
-                                   uint16_t* outVertexCount) {
+                                   uint16_t* outVertexCount, const No100fDlArrayView* view) {
     if (!No100fNativeSceneEnabled()) return false;
     No100fN9ScopeTimer n9(g_n9TryGetPackedNs, g_n9TryGetPackedCalls);
     static thread_local std::vector<uint8_t> copy;
@@ -1588,6 +1669,13 @@ bool No100fNativeSceneTryGetPacked(uint32_t listAddr, uint32_t nbytes, uint32_t 
         // geometry's mesh draws; it plays GX.
         if (mesh == nullptr && inCensus && g_arm.geometry != 0) {
             const auto armedIt = g_caches.find(g_arm.geometry);
+            // L5: an auto-admitted geometry only learns a DL that draws from
+            // its own arrays.
+            if (armedIt != g_caches.end() && armedIt->second.valid && armedIt->second.autoAdmitted &&
+                !NsAutoViewMatches(armedIt->second, view)) {
+                g_nsAutoViewReject.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
             if (armedIt != g_caches.end() && armedIt->second.valid) {
                 Cache& c = armedIt->second;
                 MeshCache* candidate = nullptr;
@@ -1650,6 +1738,12 @@ bool No100fNativeSceneTryGetPacked(uint32_t listAddr, uint32_t nbytes, uint32_t 
         if (mesh == nullptr) return false;  // not a learned list: the normal multi-DL case, GX plays it
         if (!mesh->valid || !ownerCache->valid) {
             CountFallback(kFbDlUnlearned);
+            return false;
+        }
+        // L5: re-checked on every conversion (covers re-learns and a guest
+        // that later re-points the arrays, e.g. a mesh that starts skinning).
+        if (ownerCache->autoAdmitted && !NsAutoViewMatches(*ownerCache, view)) {
+            g_nsAutoViewReject.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
         if (mesh->dl.generationTracked) {
@@ -1715,6 +1809,7 @@ bool No100fNativeSceneTryGetPacked(uint32_t listAddr, uint32_t nbytes, uint32_t 
         N8GeomNoteLocked(Memory::Read32(ownerCache->geometry + 0x10),
                          Memory::Read32(ownerCache->geometry + 0x14), ownerCache->meshCount,
                          /*isSiteDraw=*/true);
+        if (ownerCache->autoAdmitted) g_nsAutoConverted.fetch_add(1, std::memory_order_relaxed);
         copy = mesh->packed;
         *outVertexCount = mesh->vertexCount;
     }

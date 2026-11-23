@@ -217,6 +217,7 @@ struct Diag {
     bool stageTimers = false;   // Aurora per-stage GX timers from build round 1 (sets NO100F_STAGE_TIMERS=1)
     bool nativeScene = false;   // native-scene Stage 1: intercept one pinned prop atomic (sets NO100F_NATIVESCENE=1)
     bool n8c2off = false;      // N8 L2: disable the C2 generation-hook digest (sets NO100F_N8C2OFF=1)
+    bool nsAuto = false;       // L5: native-scene auto-admit, structural pin instead of the allowlist (sets NO100F_NSAUTO=1; needs nativescene)
     bool n9 = false;   // N6: N9 per-call timing gates + n9/n9sub/n9site telemetry (sets NO100F_N9=1)
     bool dlCensus = false;   // DL census (sets NO100F_DLCENSUS=1)
     int watchdogAt = 0;          // stall watchdog: one extra mark at this uptime in seconds (sets NO100F_WATCHDOG_AT); 0 = off

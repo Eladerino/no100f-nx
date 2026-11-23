@@ -65,10 +65,22 @@ void No100fNativeSceneNoteGuestDisplayList(uint32_t listAddr, uint32_t nbytes);
 // When the generation fold has moved, the drift decision is made by content
 // digest, not by the write counter: identical bytes retain the learn, only
 // a genuine content change drifts to GX (N3-LEARN-RETENTION-DESIGN.md §3).
+// L5: the vertex state the DL is about to draw with, captured at the
+// conversion site. Auto-admitted geometries (dk_diag nsauto) only learn and
+// convert a DL whose POS/NRM/CLR0/TEX0 arrays point at the parsed geometry's
+// own arrays and whose vertex descriptor is exactly those four, indexed. A
+// skinned or otherwise CPU-transformed mesh draws from a different buffer
+// (RpSkin's output), so it fails this check and stays on GX. Allowlisted
+// geometries ignore the view (their behaviour is unchanged).
+struct No100fDlArrayView {
+    uint32_t pos = 0, nrm = 0, clr0 = 0, tex0 = 0;  // GXSetArray bases as the guest passed them
+    bool descExact = false;  // desc is POS/NRM/CLR0/TEX0 indexed and nothing else
+};
 bool No100fNativeSceneTryGetPacked(uint32_t listAddr, uint32_t nbytes, uint32_t dlVerts,
                                    uint64_t dlDigest, bool dlDigestValid,
                                    const uint8_t** outData, uint32_t* outBytes,
-                                   uint16_t* outVertexCount);
+                                   uint16_t* outVertexCount,
+                                   const No100fDlArrayView* view = nullptr);
 
 // N3b (§3.5): read-only learn-state query for the array-staging skip.
 // N5: currently UNCALLED — the fold (gx_dl.cpp) calls TryConvertDl first

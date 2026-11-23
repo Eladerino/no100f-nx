@@ -1214,8 +1214,25 @@ static bool No100fNativeSceneTryConvertDl(uint32_t listAddr, uint32_t nbytes, ui
     const uint8_t* packed = nullptr;
     uint32_t packedBytes = 0;
     uint16_t packedCount = 0;
+    // L5: the vertex state this DL draws with (read by auto-admitted
+    // geometries only; see No100fDlArrayView).
+    No100fDlArrayView view;
+    view.pos = g_hleGxState.vtxArray[GX_VA_POS].base;
+    view.nrm = g_hleGxState.vtxArray[GX_VA_NRM].base;
+    view.clr0 = g_hleGxState.vtxArray[GX_VA_CLR0].base;
+    view.tex0 = g_hleGxState.vtxArray[GX_VA_TEX0].base;
+    view.descExact = true;
+    for (int attr = 0; attr < 26 && view.descExact; ++attr) {
+        const GXAttrType t = g_hleGxState.vtxDesc[attr];
+        const bool wanted = attr == GX_VA_POS || attr == GX_VA_NRM || attr == GX_VA_CLR0 || attr == GX_VA_TEX0;
+        if (wanted) {
+            view.descExact = t == GX_INDEX8 || t == GX_INDEX16;
+        } else {
+            view.descExact = t == GX_NONE;
+        }
+    }
     if (!No100fNativeSceneTryGetPacked(listAddr, nbytes, dlVerts, dlDigest, dlDigestValid,
-                                       &packed, &packedBytes, &packedCount)) {
+                                       &packed, &packedBytes, &packedCount, &view)) {
         return false;
     }
     EnsureAuroraFrameActive();
