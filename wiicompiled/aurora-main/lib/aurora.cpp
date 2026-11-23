@@ -396,18 +396,42 @@ bool wait_for_frame_worker_private_for(FrameWorkerPhase phase, std::chrono::micr
 std::atomic<uint64_t> g_frameWorkerWaitNanos[2]{};  // [0] SEALED, [1] DONE
 std::atomic<uint64_t> g_frameWorkerWaits[2]{};
 
+// N8 C7 counters (Step 2 measurement build; see N8-COUNTER-BUILD-LOG.md):
+// per-site steady_clock reads on the game thread (wait rows) and the frame
+// worker (present row). All cumulative; gated on the nativescene dk_diag
+// key via a file-local getenv check (Aurora must not depend on the runtime
+// nativescene TU), one branch per site when off. The present row is a lower
+// bound: present_presentation_job contains ~15 further unwired
+// PresentClock reads, and the wait_until_precise spin loop (:148) is the
+// largest unwired cluster (worker-thread). Counters ride the measurement
+// flight only, never a price build.
+static bool n8_counters_enabled() {
+  static const bool on = std::getenv("NO100F_NATIVESCENE") != nullptr;
+  return on;
+}
+static std::atomic<uint64_t> s_n8ClockAuroraWait{0};
+static std::atomic<uint64_t> s_n8ClockAuroraPresent{0};
+static std::chrono::steady_clock::time_point n8_aurora_wait_now() noexcept {
+  if (n8_counters_enabled()) s_n8ClockAuroraWait.fetch_add(1, std::memory_order_relaxed);
+  return std::chrono::steady_clock::now();
+}
+static PresentClock::time_point n8_aurora_present_now() noexcept {
+  if (n8_counters_enabled()) s_n8ClockAuroraPresent.fetch_add(1, std::memory_order_relaxed);
+  return PresentClock::now();
+}
+
 void wait_for_frame_worker_private(FrameWorkerPhase phase) {
   constexpr auto kWaitServiceInterval = std::chrono::milliseconds(1);
   if (frame_worker_phase_reached(phase)) {
     return;  // the common case: nothing to wait for, nothing to time
   }
-  const auto started = std::chrono::steady_clock::now();
+  const auto started = n8_aurora_wait_now();  // N8 C7: wait start read
   while (!wait_for_frame_worker_private_for(phase, kWaitServiceInterval)) {
   }
   const int slot = phase == FrameWorkerPhase::Sealed ? 0 : 1;
   g_frameWorkerWaitNanos[slot].fetch_add(
       static_cast<uint64_t>(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()),
+          std::chrono::duration_cast<std::chrono::nanoseconds>(n8_aurora_wait_now() - started).count()),  // N8 C7: wait end read
       std::memory_order_relaxed);
   g_frameWorkerWaits[slot].fetch_add(1, std::memory_order_relaxed);
 }
@@ -1217,8 +1241,8 @@ bool present_presentation_job(const PresentationJob& job) {
     aurora_switch_dk_present(job.image->texture.texture.Get());
 #endif
     record_successful_present(job.interpolated, job.logicalFrame, {}, {}, {}, {}, {},
-                              std::chrono::duration_cast<std::chrono::nanoseconds>(PresentClock::now() -
-                                                                                   submissionStarted),
+                              std::chrono::duration_cast<std::chrono::nanoseconds>(n8_aurora_present_now() -
+                                                                                   submissionStarted),  // N8 C7: present read
                               job.duplicated, job.slidPeriods, {});
     // The only sign of life on a screen that stays black: a line every ten seconds at 60 fps.
     static uint64_t s_surfacelessFrames = 0;
@@ -1235,7 +1259,7 @@ bool present_presentation_job(const PresentationJob& job) {
   if (job.presentAt != PresentClock::time_point{}) {
     // How expired the deadline already is at dequeue. Positive values mean the
     // slot cannot be paced and fires immediately, which is a burst symptom.
-    lateBy = std::chrono::duration_cast<std::chrono::nanoseconds>(PresentClock::now() -
+    lateBy = std::chrono::duration_cast<std::chrono::nanoseconds>(n8_aurora_present_now() -  // N8 C7: present read
                                                                   job.presentAt);
   }
   {
@@ -1263,7 +1287,7 @@ bool present_presentation_job(const PresentationJob& job) {
       const auto acquireStarted = PresentClock::now();
       auto acquired = acquire_surface_texture();
       acquireDuration =
-          std::chrono::duration_cast<std::chrono::nanoseconds>(PresentClock::now() - acquireStarted);
+          std::chrono::duration_cast<std::chrono::nanoseconds>(n8_aurora_present_now() - acquireStarted);  // N8 C7: present read
       g_lastAcquireNanos.store(acquireDuration.count(), std::memory_order_relaxed);
       if (acquired) {
         const wgpu::CommandEncoderDescriptor encoderDescriptor{
@@ -1340,8 +1364,8 @@ bool present_presentation_job(const PresentationJob& job) {
             record_successful_present(
                 job.interpolated, job.logicalFrame, acquireDuration, encodeDuration,
                 finishDuration, submitDuration, presentDuration,
-                std::chrono::duration_cast<std::chrono::nanoseconds>(PresentClock::now() -
-                                                                     submissionStarted),
+                std::chrono::duration_cast<std::chrono::nanoseconds>(n8_aurora_present_now() -
+                                                                     submissionStarted),  // N8 C7: present read
                 job.duplicated, job.slidPeriods, lateBy);
           } else {
             Log.warn("Surface present failed: {}", static_cast<int>(presentStatus));
@@ -1353,7 +1377,7 @@ bool present_presentation_job(const PresentationJob& job) {
     }
   }
   const auto totalDuration =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(PresentClock::now() - submissionStarted);
+      std::chrono::duration_cast<std::chrono::nanoseconds>(n8_aurora_present_now() - submissionStarted);  // N8 C7: present read
   constexpr int kStallRebuildThreshold = 3;
   constexpr auto kStallRebuildCooldown = std::chrono::seconds(5);
   static int s_consecutiveStalledPresents = 0;
@@ -2360,10 +2384,10 @@ std::chrono::nanoseconds wait_for_frame_worker_sealed() {
   if (g_frameWorker.sealed.load(std::memory_order_acquire)) {
     return std::chrono::nanoseconds::zero();
   }
-  const auto started = std::chrono::steady_clock::now();
+  const auto started = n8_aurora_wait_now();  // N8 C7: sealed-wait start read
   wait_for_frame_worker_private(FrameWorkerPhase::Sealed);
   if (window_owner::enabled()) window_owner::check();
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started);
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(n8_aurora_wait_now() - started);  // N8 C7: sealed-wait end read
 }
 bool wait_for_frame_worker_for(std::chrono::microseconds timeout) {
   const bool result = wait_for_frame_worker_private_for(FrameWorkerPhase::Done, timeout);
@@ -2395,6 +2419,11 @@ void aurora_frame_worker_wait_totals(uint64_t* sealedNanos, uint64_t* doneNanos,
   *doneNanos = aurora::g_frameWorkerWaitNanos[1].load(std::memory_order_relaxed);
   *sealedWaits = aurora::g_frameWorkerWaits[0].load(std::memory_order_relaxed);
   *doneWaits = aurora::g_frameWorkerWaits[1].load(std::memory_order_relaxed);
+}
+// N8 C7 clock-read counters since start (Aurora wait + present rows): the runtime's [n8counters] line.
+void aurora_n8_clock_totals(uint64_t* waits, uint64_t* present) {
+  *waits = aurora::s_n8ClockAuroraWait.load(std::memory_order_relaxed);
+  *present = aurora::s_n8ClockAuroraPresent.load(std::memory_order_relaxed);
 }
 bool aurora_frame_worker_idle() {
   return aurora::frame_worker_phase_reached(aurora::FrameWorkerPhase::Sealed) &&

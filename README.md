@@ -195,7 +195,7 @@ In WSL (or on Linux) with podman or docker, from the clone:
 switch/scripts/build-switch.sh --deko
 ```
 
-`--deko` is the build that matters: it turns on the deko3d renderer (`FW_SWITCH_DEKO=ON`) in its own `build-deko` folder. The script copies the sources into `~/no100f-switch`, builds inside the container, and stages the result by default to `Downloads/no100f-nx-sd/switch/no100f-nx/`, laid out like the SD card. Use `--out none` to skip staging, and `--out DIR` to stage somewhere else. `--game` also stages your extracted disc as `switch/no100f-nx/game/` (about 1.4 GB, only needed once).
+`--deko` is the build that matters: it turns on the deko3d renderer (`FW_SWITCH_DEKO=ON`) in its own `build-deko` folder. The script copies the sources into `~/no100f-switch`, builds inside the container, and stages the result by default to `Switch Ports/FrightWorks/no100f-nx-sd/switch/no100f-nx/`, laid out like the SD card. Use `--out none` to skip staging, and `--out DIR` to stage somewhere else. `--game` also stages your extracted disc as `switch/no100f-nx/game/` (about 1.4 GB, only needed once).
 
 | Variant | What it does | When to use it |
 |---|---|---|

@@ -219,7 +219,7 @@ set(RECOMP_PPC_SEMANTIC_RUNTIME_SOURCES
     "${CMAKE_CURRENT_LIST_DIR}/src/fpu_helpers.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/hle/input/kpad.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/src/hle/no100f_particles_update.cpp")
+"${CMAKE_CURRENT_LIST_DIR}/src/hle/no100f_particles_update.cpp")
 set_source_files_properties(${RECOMP_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
     SKIP_UNITY_BUILD_INCLUSION ON
     SKIP_PRECOMPILE_HEADERS ON

@@ -1,7 +1,11 @@
 #include "gx_internal.h"
 #include "runtime_log.h"
 
+#include <atomic>
 #include <cstdio>
+#include <cstdlib>
+
+#include "../no100f_native_scene.h"
 
 GxDisplayListState g_dlRecordState{};
 
@@ -73,18 +77,30 @@ void GxBeginFrameWaitTotals(uint64_t* nanos, uint64_t* sleeps) {
     *sleeps = g_beginFrameWaitSleeps;
 }
 
+// N8 C7: gx_frame wait-loop clock reads (4 sites in BeginNextAuroraFrameWithRetry).
+// Gated on the nativescene dk_diag key (No100fNativeSceneEnabled), one branch
+// per site when off. Counters ride the measurement flight only, never a price build.
+static std::atomic<uint64_t> s_n8ClockGxFrame{0};
+static std::chrono::steady_clock::time_point n8_gxframe_now() noexcept {
+  if (No100fNativeSceneEnabled()) s_n8ClockGxFrame.fetch_add(1, std::memory_order_relaxed);
+  return std::chrono::steady_clock::now();
+}
+uint64_t gxframe_n8_clock_total() {
+  return s_n8ClockGxFrame.load(std::memory_order_relaxed);
+}
+
 void BeginNextAuroraFrameWithRetry(std::chrono::milliseconds timeout) {
-    const auto start = std::chrono::steady_clock::now();
+    const auto start = n8_gxframe_now();  // N8 C7: wait-loop start read
     const auto deadline = start + timeout;
     uint32_t attempts = 0;
-    while (std::chrono::steady_clock::now() < deadline) {
+    while (n8_gxframe_now() < deadline) {  // N8 C7: wait-loop condition read
         UpdateAuroraAndProcessEvents();
         ++attempts;
         if (BeginAuroraFrame()) {
             g_auroraFrameActive.store(true, std::memory_order_release);
             if (attempts > 1) {
                 g_beginFrameWaitNanos += static_cast<uint64_t>(
-                    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(n8_gxframe_now() - start)  // N8 C7: wait-loop end read
                         .count());
             }
             return;
@@ -93,7 +109,7 @@ void BeginNextAuroraFrameWithRetry(std::chrono::milliseconds timeout) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     g_beginFrameWaitNanos += static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        std::chrono::duration_cast<std::chrono::nanoseconds>(n8_gxframe_now() - start).count());  // N8 C7: wait-loop expired read
     // Retry window expired: the aurora frame stays INACTIVE and every GX
     // command until the next EnsureAuroraFrameActive is silently dropped
     // (draws, one-shot bakes, copies). This is a frame-loss event.

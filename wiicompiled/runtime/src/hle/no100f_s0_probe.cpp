@@ -125,6 +125,13 @@ extern "C" void No100f_ProbeGXCallDisplayList(CpuContext* ctx)
         const int chainCount = S0ProbeCallerChain(ctx, chain, 6);
         No100fDlCensusNoteCall(ctx->gpr[3], ctx->gpr[4], ctx->lr, chain, chainCount);
     }
+    // N8 C4: note this submission's caller class for the per-DL submission-site
+    // counters. Gated on the nativescene key inside; inert when off. Resolves
+    // the direct LR first and chain-walks only on a miss, so it costs ~1
+    // cached lookup per DL instead of the census's unconditional chain walk.
+    if (No100fNativeSceneEnabled()) {
+        No100fDlSiteNoteCall(ctx->gpr[3], ctx->gpr[4], ctx->lr, ctx->gpr[1]);
+    }
     No100fNativeSceneNoteGuestDisplayList(ctx->gpr[3], ctx->gpr[4]);
     uint32_t cr0_0 = 0;
 

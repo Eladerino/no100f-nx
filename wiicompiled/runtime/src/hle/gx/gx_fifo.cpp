@@ -1,4 +1,5 @@
 #include "gx_internal.h"
+#include "../no100f_native_scene.h"
 #include "gx_stream_common.h"
 #include "gx_cp_decode.h"
 #include "isa/big_endian.h"
@@ -560,6 +561,82 @@ void GxFifoFastTotals(uint64_t* fastWords, uint64_t* mismatches) {
     *mismatches = g_fifoFastMismatches;
 }
 
+// L2 write-side counters (N8 L2 counter build): HleFifoWrite time split +
+// single-word run-length histogram. Game thread only: plain counters, the
+// same idiom as g_fifoWriteCalls above. Gated on the nativescene dk_diag
+// key (No100fNativeSceneEnabled), so the toggle set reads zero. The time
+// split is SAMPLED 1 in 64 calls: a clock read costs ~38 ns (clock_cal)
+// and the route runs ~39k HleFifoWrite calls per frame, so timing every
+// call would cost ~6 ms/frame of instrument; the sampled buckets are
+// scaled by total/sampled at the print site in vi.cpp. The histogram
+// counts every direct call (no clock reads).
+static uint64_t s_l2CallCount = 0;     // HleFifoWrite calls seen while nativescene is on
+static uint64_t s_l2SampledCalls = 0;  // timed calls (1 in 64)
+static uint64_t s_l2DispatchNanos = 0; // entry to the store (sampled)
+static uint64_t s_l2StoreNanos = 0;    // the ring append itself (sampled)
+static uint64_t s_l2WakeNanos = 0;     // after the store: fifofast check + parse loop (sampled)
+static uint64_t s_l2RunLen = 0;        // current run of consecutive direct single-word calls
+static uint64_t s_l2RunWords = 0;      // direct single-word calls that joined a run
+static uint64_t s_l2Runs1 = 0, s_l2Runs2_4 = 0, s_l2Runs5_16 = 0, s_l2Runs17 = 0;
+static bool s_l2InChunkedBurst = false;  // HleFifoWriteBurstChunked's inner calls are burst words
+void GxL2Totals(uint64_t* sampledCalls, uint64_t* dispatchNanos, uint64_t* storeNanos, uint64_t* wakeNanos,
+                uint64_t* runWords, uint64_t* runs1, uint64_t* runs2_4, uint64_t* runs5_16,
+                uint64_t* runs17) {
+    *sampledCalls = s_l2SampledCalls;
+    *dispatchNanos = s_l2DispatchNanos;
+    *storeNanos = s_l2StoreNanos;
+    *wakeNanos = s_l2WakeNanos;
+    *runWords = s_l2RunWords;
+    *runs1 = s_l2Runs1;
+    *runs2_4 = s_l2Runs2_4;
+    *runs5_16 = s_l2Runs5_16;
+    *runs17 = s_l2Runs17;
+}
+// Bucket the current single-word run and reset it. A run ends at a burst
+// (GX_HLE_FIFO_WriteBurst entry) or a display-list write; a run still open
+// at a window boundary is counted when it next flushes.
+static void l2_flush_run() {
+    if (s_l2RunLen == 0) return;
+    if (s_l2RunLen == 1) ++s_l2Runs1;
+    else if (s_l2RunLen <= 4) ++s_l2Runs2_4;
+    else if (s_l2RunLen <= 16) ++s_l2Runs5_16;
+    else ++s_l2Runs17;
+    s_l2RunLen = 0;
+}
+// RAII: mark HleFifoWrite calls made by HleFifoWriteBurstChunked as burst
+// words (they must not extend the single-word run); restores the previous
+// value so a nested burst cannot clear the flag early.
+struct L2ChunkedBurstScope {
+    bool prev;
+    L2ChunkedBurstScope() : prev(s_l2InChunkedBurst) { s_l2InChunkedBurst = true; }
+    ~L2ChunkedBurstScope() { s_l2InChunkedBurst = prev; }
+};
+// L2 time-split guard: records t3 at every HleFifoWrite exit and books the
+// sampled split. t1/t2 are set by the body just before/after the store; a
+// return before t1 (display-list recording) books the whole call as dispatch.
+struct L2WriteTimer {
+    bool sample;
+    std::chrono::steady_clock::time_point t0;
+    std::chrono::steady_clock::time_point& t1;
+    std::chrono::steady_clock::time_point& t2;
+    ~L2WriteTimer() {
+        if (!sample) return;
+        const auto t3 = std::chrono::steady_clock::now();
+        const auto ns = [](std::chrono::steady_clock::time_point a,
+                           std::chrono::steady_clock::time_point b) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+        };
+        if (t1 == std::chrono::steady_clock::time_point{}) {
+            s_l2DispatchNanos += ns(t0, t3);
+            return;
+        }
+        s_l2DispatchNanos += ns(t0, t1);
+        s_l2StoreNanos += ns(t1, t2);
+        s_l2WakeNanos += ns(t2, t3);
+    }
+};
+
 // phasetime (PHASETIME design, Nov 19, 2026): the first GX packet the parser completes after
 // each present, as a steady-clock timestamp (nanos since epoch; 0 = none this interval).
 // Written here (the parser's consumeBytes choke: every parse-loop completion passes through
@@ -573,13 +650,27 @@ uint64_t PhaseTimeFirstPacketNanos() { return g_phaseFirstPacketNanos.load(std::
 void PhaseTimeClearFirstPacket() { g_phaseFirstPacketNanos.store(0, std::memory_order_relaxed); }
 
 void HleFifoWrite(u32 val, uint32_t sizeBytes) {
+    // L2: sample the time split 1 in 64 calls (see the note above GxL2Totals).
+    const bool l2On = No100fNativeSceneEnabled();
+    const bool l2Sample = l2On && ((++s_l2CallCount & 63) == 0);
+    if (l2Sample) ++s_l2SampledCalls;
+    const auto l2T0 = l2Sample ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+    std::chrono::steady_clock::time_point l2T1{}, l2T2{};
+    L2WriteTimer l2Timer{l2Sample, l2T0, l2T1, l2T2};
     ++g_fifoWriteCalls;
     g_fifoWriteBytes += sizeBytes == 0 ? 4 : sizeBytes;
     const bool recordOnly = IsDisplayListActive();
     if (recordOnly) {
         ++g_fifoDlWriteCalls;
         WriteDisplayListData(val, sizeBytes);
+        l2_flush_run();  // a display-list write breaks the raw single-word run
         return;
+    }
+    // L2: a direct raw single-word call extends the run (burst words do not).
+    if (l2On && !s_l2InChunkedBurst) {
+        ++s_l2RunLen;
+        ++s_l2RunWords;
     }
     if (PipeRingEnabled()) {   // NO100F diagnostic: the last raw pipe writes, dumped when the parser meets a zero-count draw.
         g_pipeRing[g_pipeRingPos % kPipeRing] = {val, sizeBytes, RecompMod::CurrentTranslatedExecutionAddress()};
@@ -668,7 +759,9 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
         return true;
     };
 
+    if (l2Sample) l2T1 = std::chrono::steady_clock::now();
     pushBytes(val, sizeBytes == 0 ? 4 : sizeBytes);
+    if (l2Sample) l2T2 = std::chrono::steady_clock::now();
 
     // fifofast: a raw draw packet is still filling; nothing to parse until it is whole.
     if (g_pendingRawPacketBytes != 0) {
@@ -982,6 +1075,7 @@ void HleFifoWrite(u32 val, uint32_t sizeBytes) {
 // bulk-appended ahead of a single parse because the parser can re-enter GX HLE (nested display
 // lists, XF/draw calls), which would misorder that work relative to the stream.
 static void HleFifoWriteBurstChunked(const uint8_t* data, uint32_t sizeBytes) {
+    L2ChunkedBurstScope l2Chunked;  // inner HleFifoWrite calls are burst words, not run members
     uint32_t offset = 0;
     for (; offset + 4u <= sizeBytes; offset += 4u) {
         HleFifoWrite(ReadBE32(data + offset), 4);
@@ -1104,6 +1198,7 @@ extern "C" void GX_HLE_FIFO_WriteBurst(const uint8_t* data, uint32_t sizeBytes) 
     if (data == nullptr || sizeBytes == 0) {
         return;
     }
+    l2_flush_run();  // a burst breaks the single-word run (both the direct and chunked paths)
     ++g_fifoBurstCalls;
     g_fifoBurstBytes += sizeBytes;
 

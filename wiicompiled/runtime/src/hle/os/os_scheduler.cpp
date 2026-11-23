@@ -17,8 +17,22 @@
 #include "runtime_log.h"
 #include "os_internal.h"
 
+#include "../no100f_native_scene.h"
+
 // Time the guest scheduler spent in its idle loop (no runnable guest thread) since start.
 static std::atomic<uint64_t> g_guestIdleNanos{0};
+
+// N8 C7: IdleTimer clock reads (2 per idle entry). Gated on the nativescene
+// dk_diag key (No100fNativeSceneEnabled), one branch per site when off.
+// Counters ride the measurement flight only, never a price build.
+static std::atomic<uint64_t> s_n8ClockOsSchedIdle{0};
+static std::chrono::steady_clock::time_point n8_ossched_now() noexcept {
+  if (No100fNativeSceneEnabled()) s_n8ClockOsSchedIdle.fetch_add(1, std::memory_order_relaxed);
+  return std::chrono::steady_clock::now();
+}
+uint64_t ossched_n8_idle_clock_total() {
+  return s_n8ClockOsSchedIdle.load(std::memory_order_relaxed);
+}
 
 // phasetime (PHASETIME design, Nov 19, 2026): wall time per guest thread, from SelectThread's
 // commit points. The running word has exactly two writers inside SelectThread (the idle entry
@@ -411,10 +425,10 @@ extern "C" void SelectThread_801a9c08(CpuContext* ctx)
         OS__SetCurrentContext_801a1e70(kIdleThreadContextAddr);
         // Idle time (no guest thread runnable: VIWaitForRetrace sleepers, audio/alarm waits), so the
         // frame lines in hle/vi.cpp can split the guest's time into work and waiting.
-        const auto idleStart = std::chrono::steady_clock::now();
+        const auto idleStart = n8_ossched_now();  // N8 C7: IdleTimer start read
         struct IdleTimer {
             std::chrono::steady_clock::time_point start;
-            ~IdleTimer() { NoteGuestIdle(std::chrono::steady_clock::now() - start); }
+            ~IdleTimer() { const auto end = n8_ossched_now(); NoteGuestIdle(end - start); }  // N8 C7: IdleTimer end read
         } idleTimer{idleStart};
 
         while (true) {

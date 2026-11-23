@@ -85,6 +85,7 @@ void drain() {
   uint32_t consumed = 0;
   bool retried = false;
   while (consumed < detail::sBufferSize) {
+    n8_note_process_caller(true);  // L2: drain-path process() call
     const auto count = process(detail::sBufferData + consumed, detail::sBufferSize - consumed, true);
     if (count == 0 && retried)
       throw gfx::StagingCapacityError("FIFO draw does not fit after capacity submission");

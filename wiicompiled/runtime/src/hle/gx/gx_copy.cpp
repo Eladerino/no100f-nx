@@ -8,12 +8,15 @@
 #include <dolphin/gx/GXAurora.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <string>
 #include <map>
 #include <mutex>
 #include <vector>
+
+#include "../no100f_native_scene.h"
 
 // EFB-to-texture copies (GXCopyTex) and display copies (GXCopyDisp) since start, for hle/vi.cpp's
 // frame lines. Game thread only.
@@ -128,6 +131,20 @@ PPC_NATIVE_OVERRIDE_VOID(800FED24, GX__SetDispCopyGamma_8016fc24, (uint32_t g), 
 // Copy Execution
 // ============================================================================
 
+// N8 C7: settings-overlay clock reads (2 per CopyDisp). Gated on the
+// nativescene dk_diag key (No100fNativeSceneEnabled), one branch per site
+// when off. The :186 read inside the NO100F_LOG_COPY_FRAMES block is NOT
+// wired (off in flights). Counters ride the measurement flight only, never
+// a price build.
+static std::atomic<uint64_t> s_n8ClockGxCopy{0};
+static std::chrono::steady_clock::time_point n8_gxcopy_now() noexcept {
+  if (No100fNativeSceneEnabled()) s_n8ClockGxCopy.fetch_add(1, std::memory_order_relaxed);
+  return std::chrono::steady_clock::now();
+}
+uint64_t gxcopy_n8_overlay_clock_total() {
+  return s_n8ClockGxCopy.load(std::memory_order_relaxed);
+}
+
 extern "C" void GX__CopyDisp_8016fc38(uint32_t da, uint32_t c) {
     EnsureAuroraFrameActive();
     // GX copies are FIFO-ordered on hardware. Drain submitted draws before
@@ -145,10 +162,11 @@ extern "C" void GX__CopyDisp_8016fc38(uint32_t da, uint32_t c) {
     // (not the cheaper SEALED phase GXDrawDone waits for) because ImGui's draw lists, owned by
     // Aurora's render worker, replay during encode; aurora_end_frame would join here anyway.
     aurora_wait_for_frame_worker();
-    const auto overlayStart = std::chrono::steady_clock::now();
+    const auto overlayStart = n8_gxcopy_now();  // N8 C7: overlay start read
     settings_overlay::Draw();
+    const auto overlayEnd = n8_gxcopy_now();  // N8 C7: overlay end read
     g_overlayDrawNanos += static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - overlayStart).count());
+        std::chrono::duration_cast<std::chrono::nanoseconds>(overlayEnd - overlayStart).count());
     // Seal, pace to the VI retrace boundary (Aurora renders the sealed frame
     // during the wait), and pre-warm the next frame.
     VI_HLE_PresentFrame(/*presentedXfb=*/true, /*paceToRetrace=*/true);

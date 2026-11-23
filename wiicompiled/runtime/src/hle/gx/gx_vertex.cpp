@@ -7,8 +7,11 @@
 #include "guest_interrupt_context.h"
 #include "runtime_log.h"
 
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
+
+#include "../no100f_native_scene.h"
 
 namespace {
 uint32_t CanonicalVtxAttr(uint32_t attr) {
@@ -240,6 +243,16 @@ namespace {
 thread_local bool g_inGxBeginOrFifo = false;
 thread_local std::chrono::steady_clock::time_point g_nextDeferredTimingPoll{};
 
+// N8 C7: DeferredTiming clock read (one per ServiceDeferredTimingDuringGxWork
+// call). Gated on the nativescene dk_diag key (No100fNativeSceneEnabled),
+// one branch per site when off. Counters ride the measurement flight only,
+// never a price build.
+static std::atomic<uint64_t> s_n8ClockGxDeferred{0};
+static std::chrono::steady_clock::time_point n8_gxvertex_now() noexcept {
+  if (No100fNativeSceneEnabled()) s_n8ClockGxDeferred.fetch_add(1, std::memory_order_relaxed);
+  return std::chrono::steady_clock::now();
+}
+
 void ServiceDeferredTimingDuringGxWork() {
     // Wall-clock driven, so where it lands in the guest's execution depends on host speed; the
     // deterministic mode (det_clock.h) delivers these events only at their virtual time.
@@ -247,7 +260,7 @@ void ServiceDeferredTimingDuringGxWork() {
         return;
     }
 
-    const auto now = std::chrono::steady_clock::now();
+    const auto now = n8_gxvertex_now();  // N8 C7: DeferredTiming read
     if (now < g_nextDeferredTimingPoll) {
         return;
     }
@@ -275,6 +288,11 @@ void ServiceDeferredTimingDuringGxWork() {
     }
     g_inGxBeginOrFifo = false;
 }
+}
+
+// N8 C7: DeferredTiming clock reads since start (the runtime's [n8counters] line).
+uint64_t gx_n8_deferred_clock_total() {
+  return s_n8ClockGxDeferred.load(std::memory_order_relaxed);
 }
 
 uint32_t GxPresentedFrames();

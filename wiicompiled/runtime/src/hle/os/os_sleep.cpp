@@ -20,14 +20,28 @@
 #include "runtime_log.h"
 #include "os_internal.h"
 
+#include "../no100f_native_scene.h"
+
 namespace {
 // Sleep deadlines live on the virtual timeline in deterministic mode (see det_clock.h), so a
 // sleeper wakes at the same point of guest execution on every device.
+//
+// N8 C7: SleepClockNow clock reads (steady_clock branch only, not DetClock).
+// Gated on the nativescene dk_diag key (No100fNativeSceneEnabled), one branch
+// per site when off. Counters ride the measurement flight only, never a price build.
+static std::atomic<uint64_t> s_n8ClockOsSleep{0};
 std::chrono::steady_clock::time_point SleepClockNow()
 {
-    return DetClock::Enabled() ? DetClock::NowTimePoint() : std::chrono::steady_clock::now();
+    if (DetClock::Enabled()) return DetClock::NowTimePoint();
+    if (No100fNativeSceneEnabled()) s_n8ClockOsSleep.fetch_add(1, std::memory_order_relaxed);
+    return std::chrono::steady_clock::now();
 }
 } // namespace
+
+// N8 C7: SleepClockNow clock reads since start (the runtime's [n8counters] line).
+uint64_t ossleep_n8_clock_total() {
+  return s_n8ClockOsSleep.load(std::memory_order_relaxed);
+}
 
 namespace OsHleInternal {
 std::mutex gSleepTimerMutex;

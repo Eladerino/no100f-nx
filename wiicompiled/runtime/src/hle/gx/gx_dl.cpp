@@ -1203,12 +1203,19 @@ static void ApplyAuroraVtxAttrFmtForDisplayList(GXVtxFmt fmt, bool mixed) {
 // direct layout is published straight into Aurora, bypassing the HLE applied
 // mirrors; afterwards the applied state is invalidated and the list's own
 // state re-applied, so the next list sees exactly what it would have seen.
-static bool No100fNativeSceneTryConvertDl(uint32_t listAddr, uint32_t nbytes, GXVtxFmt dlVtxFmt,
-                                          bool dlVtxFmtMixed) {
+// N3: one DL per mesh, so this submits one mesh's draw per call; the
+// meshes arrive as successive DLs in stream order (Q1 outcome A: no state
+// work between them).
+static bool No100fNativeSceneTryConvertDl(uint32_t listAddr, uint32_t nbytes, uint32_t dlVerts,
+                                          GXVtxFmt dlVtxFmt, bool dlVtxFmtMixed,
+                                          uint64_t dlDigest, bool dlDigestValid) {
+    // N9: per-call timing for the conversion site (N4 diagnosis §3.2).
+    No100fN9ScopeTimer n9(g_n9TryConvertDlNs, g_n9TryConvertDlCalls);
     const uint8_t* packed = nullptr;
     uint32_t packedBytes = 0;
     uint16_t packedCount = 0;
-    if (!No100fNativeSceneTryGetPacked(listAddr, nbytes, &packed, &packedBytes, &packedCount)) {
+    if (!No100fNativeSceneTryGetPacked(listAddr, nbytes, dlVerts, dlDigest, dlDigestValid,
+                                       &packed, &packedBytes, &packedCount)) {
         return false;
     }
     EnsureAuroraFrameActive();
@@ -1549,58 +1556,112 @@ extern "C" void GX__CallDisplayList_80172f64(uint32_t listAddr, uint32_t nbytes)
         // N2 DL census: the scan's maxIdx is final here on both the cached
         // and uncached paths. Vertices = the largest index count over the
         // indexed attributes (maxIdx+1); direct-mode draws contribute 0.
-        {
-            uint32_t dlVerts = 0;
-            for (size_t a = 0; a < maxIdx.size(); ++a) {
-                if (sawIdx[a] && maxIdx[a] + 1u > dlVerts) dlVerts = maxIdx[a] + 1u;
-            }
-            No100fDlCensusAccumulate(listAddr, nbytes, true, dlVerts);
+        // dlVerts is also the native-scene learn cross-check (N3).
+        uint32_t dlVerts = 0;
+        for (size_t a = 0; a < maxIdx.size(); ++a) {
+            if (sawIdx[a] && maxIdx[a] + 1u > dlVerts) dlVerts = maxIdx[a] + 1u;
         }
+        No100fDlCensusAccumulate(listAddr, nbytes, true, dlVerts);
 
         if (needsFlatten) {
             bool flattenApplyOk = flattenOk && scanOk && auroraStream != nullptr && auroraStreamBytes != 0;
+            // N5 (fold): the conversion is attempted BEFORE array staging,
+            // replacing the N3b IsLearned query (1,301 ns/call on the N4
+            // flight). The state at TryConvertDl entry (VtxDesc/VtxAttrFmt
+            // applied, XF arrays applied, vertex arrays NOT staged) is
+            // exactly the state it sees today on the IsLearned-true path,
+            // which converts without staged arrays; the conversion
+            // publishes its own packed stream and never reads the staged
+            // arrays, and after a conversion TryConvertDl invalidates the
+            // applied-array mirrors, so the next DL re-stages
+            // unconditionally. A conversion failure falls back to staging
+            // + GX below. One difference from N3b: a DL whose array staging
+            // would have failed now gets a conversion attempt first — safe
+            // for the same reason (conversion never reads staged arrays),
+            // and it only triggers in the staging-failure edge case.
             if (flattenApplyOk) {
+                // N6: fold-site pre timer (n9-gated): the desc/fmt/XF
+                // application before TryConvertDl at this submission site.
+                No100fN9ScopeTimer sitePreT(g_n9SitePreNs, g_n9SitePreCalls);
                 ApplyAuroraVtxDesc();
                 ApplyAuroraVtxAttrFmtForDisplayList(dlVtxFmt, dlVtxFmtMixed);
-                const bool flattenArraysOk =
-                    ApplyAuroraArraysForDisplayList(maxIdx, sawIdx, dlVtxFmt, dlVtxFmtMixed);
                 const bool flattenXfOk =
                     ApplyAuroraIndexedXFArraysForDisplayList(maxXfIdx, maxXfBytes, sawXfIdx);
-                flattenApplyOk = flattenArraysOk && flattenXfOk;
+                flattenApplyOk = flattenXfOk;
             }
             if (flattenApplyOk) {
-                if (No100fNativeSceneTryConvertDl(listAddr, nbytes, dlVtxFmt, dlVtxFmtMixed)) {
+                // N3a: pass the scan probe's content digest into the conversion
+                // site (the probe already computed it; no extra hashing here).
+                if (No100fNativeSceneTryConvertDl(listAddr, nbytes, dlVerts, dlVtxFmt, dlVtxFmtMixed,
+                                                  probe.contentDigest, probe.digestValid)) {
+                    // Converted without staging: count the skip (N5: the
+                    // counter now counts conversions, not IsLearned-true
+                    // queries — it tracks native_draws by construction).
+                    No100fNativeSceneCountStagingSkipped();
                     return;
                 }
-                EnsureAuroraFrameActive();
-                GXMarkFrameWork();
-                GXCallDisplayList(auroraStream, auroraStreamBytes);
-                // No flip back to GX_DIRECT here
-                SyncAppliedVtxStateFromHleReal();
-                return;
+                {
+                    // N6: fold-site post timer (n9-gated): the forced array
+                    // re-stage + GX submit + state sync after a failed
+                    // conversion.
+                    No100fN9ScopeTimer sitePostT(g_n9SitePostNs, g_n9SitePostCalls);
+                    if (!ApplyAuroraArraysForDisplayList(maxIdx, sawIdx, dlVtxFmt, dlVtxFmtMixed)) {
+                        // Staging failed on the fallback: fall through to the
+                        // ParseDisplayList path below, exactly as
+                        // flattenApplyOk==false does.
+                    } else {
+                        EnsureAuroraFrameActive();
+                        GXMarkFrameWork();
+                        GXCallDisplayList(auroraStream, auroraStreamBytes);
+                        // No flip back to GX_DIRECT here
+                        SyncAppliedVtxStateFromHleReal();
+                        return;
+                    }
+                }
             }
 
         } else {
             bool applyOk = scanOk;
-            bool arraysOk = false;
-            bool xfOk = false;
+            // N5 (fold): see the flatten path above — conversion is
+            // attempted before array staging, replacing the N3b IsLearned
+            // query; a conversion failure falls back to staging + GX.
             if (scanOk) {
+                // N6: fold-site pre timer (n9-gated): the desc/fmt/XF
+                // application before TryConvertDl at this submission site.
+                No100fN9ScopeTimer sitePreT(g_n9SitePreNs, g_n9SitePreCalls);
                 ApplyAuroraVtxDesc();
                 ApplyAuroraVtxAttrFmtForDisplayList(dlVtxFmt, dlVtxFmtMixed);
-                arraysOk = ApplyAuroraArraysForDisplayList(maxIdx, sawIdx, dlVtxFmt, dlVtxFmtMixed);
-                xfOk = ApplyAuroraIndexedXFArraysForDisplayList(maxXfIdx, maxXfBytes, sawXfIdx);
-                applyOk = arraysOk && xfOk;
+                const bool xfOk =
+                    ApplyAuroraIndexedXFArraysForDisplayList(maxXfIdx, maxXfBytes, sawXfIdx);
+                applyOk = xfOk;
             }
             if (applyOk) {
-                if (No100fNativeSceneTryConvertDl(listAddr, nbytes, dlVtxFmt, dlVtxFmtMixed)) {
+                // N3a: pass the scan probe's content digest into the conversion
+                // site (the probe already computed it; no extra hashing here).
+                if (No100fNativeSceneTryConvertDl(listAddr, nbytes, dlVerts, dlVtxFmt, dlVtxFmtMixed,
+                                                  probe.contentDigest, probe.digestValid)) {
+                    // Converted without staging: count the skip (N5: the
+                    // counter now counts conversions — see the flatten path).
+                    No100fNativeSceneCountStagingSkipped();
                     return;
                 }
-                EnsureAuroraFrameActive();
-                GXMarkFrameWork();
-                GXCallDisplayList(list, nbytes);
+                {
+                    // N6: fold-site post timer (n9-gated): the forced array
+                    // re-stage + GX submit + state sync after a failed
+                    // conversion.
+                    No100fN9ScopeTimer sitePostT(g_n9SitePostNs, g_n9SitePostCalls);
+                    if (!ApplyAuroraArraysForDisplayList(maxIdx, sawIdx, dlVtxFmt, dlVtxFmtMixed)) {
+                        // Staging failed on the fallback: fall through to the
+                        // ParseDisplayList path below, exactly as applyOk==false does.
+                    } else {
+                        EnsureAuroraFrameActive();
+                        GXMarkFrameWork();
+                        GXCallDisplayList(list, nbytes);
 
-                SyncAppliedVtxStateFromHleReal();
-                return;
+                        SyncAppliedVtxStateFromHleReal();
+                        return;
+                    }
+                }
             }
 
         }

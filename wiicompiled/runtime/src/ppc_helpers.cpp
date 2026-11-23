@@ -6,8 +6,10 @@
 #include "memory.h"
 #include "runtime_log.h"
 #include "timebase_contract.h"
+#include "hle/no100f_native_scene.h"
 
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <cmath>
@@ -69,11 +71,23 @@ const uint64_t g_timeBaseEpoch = [] {
     return secs > 0 ? static_cast<uint64_t>(secs) * TimeBaseContract::kTicksPerSecond : uint64_t{0};
 }();
 
+// N8 C7: GetTimeBase clock read (1 per call; the static init above is
+// boot-only and not counted; the DetClock path takes no steady read).
+// Gated on the nativescene dk_diag key (No100fNativeSceneEnabled), one
+// branch per site when off. Counters ride the measurement flight only,
+// never a price build.
+static std::atomic<uint64_t> s_n8ClockPpcTimeBase{0};
+static std::chrono::steady_clock::time_point n8_ppchelp_now() noexcept {
+  if (No100fNativeSceneEnabled()) s_n8ClockPpcTimeBase.fetch_add(1, std::memory_order_relaxed);
+  return std::chrono::steady_clock::now();
+}
+
 uint64_t GetTimeBase() {
     if (DetClock::Enabled()) {
         return DetClock::Now();
     }
-    const auto elapsed = std::chrono::steady_clock::now() - g_timeBaseStart;
+    const auto n8now = n8_ppchelp_now();  // N8 C7: GetTimeBase read
+    const auto elapsed = n8now - g_timeBaseStart;
     const auto nanoseconds =
         std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count();
     return g_timeBaseEpoch + TimeBaseContract::NanosecondsToTicks(static_cast<uint64_t>(nanoseconds));
@@ -149,6 +163,11 @@ inline void UpdateFpscrSummary(CpuContext* cpu)
 }
 
 } // namespace
+
+// N8 C7: GetTimeBase clock reads since start (the runtime's [n8counters] line).
+uint64_t ppchelp_n8_timebase_clock_total() {
+  return s_n8ClockPpcTimeBase.load(std::memory_order_relaxed);
+}
 
 extern "C" uint32_t PPC_UpdateCarryAdd(uint32_t lhs, uint32_t rhs, uint32_t carryIn)
 {

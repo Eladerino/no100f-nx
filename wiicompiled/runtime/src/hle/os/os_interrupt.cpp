@@ -16,6 +16,8 @@
 #include "runtime_log.h"
 #include "os_internal.h"
 
+#include "../no100f_native_scene.h"
+
 extern "C" uint32_t SetInterruptMask_801a66e0(uint32_t mask, uint32_t enable);
 
 namespace OsHleInternal {
@@ -79,13 +81,26 @@ bool OS_HLE_InRestoreDelivery()
 // NO100F busy-waits on counters its AX frame callback advances (sound fades before a level load) with
 // nothing in the loop but OSDisableInterrupts/OSRestoreInterrupts. On hardware the pending interrupts are
 // taken the moment interrupts are re-enabled, so deliver due VI/alarm/audio work here (at most every 1 ms).
+// N8 C7: one clock read per DeliverPendingInterruptsOnEnable call, before the
+// 1 ms throttle check. Gated on the nativescene dk_diag key
+// (No100fNativeSceneEnabled), one branch per site when off. Counters ride the
+// measurement flight only, never a price build.
+static std::atomic<uint64_t> s_n8ClockOsIntr{0};
+static std::chrono::steady_clock::time_point n8_osintr_now() noexcept {
+  if (No100fNativeSceneEnabled()) s_n8ClockOsIntr.fetch_add(1, std::memory_order_relaxed);
+  return std::chrono::steady_clock::now();
+}
+uint64_t osintr_n8_clock_total() {
+  return s_n8ClockOsIntr.load(std::memory_order_relaxed);
+}
 static void DeliverPendingInterruptsOnEnable()
 {
     static thread_local bool inside = false;
     static std::atomic<int64_t> lastUs{0};
     if (inside) return;
+    const auto n8now = n8_osintr_now();  // N8 C7: DeliverPendingInterruptsOnEnable read
     const int64_t now = std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
+        n8now.time_since_epoch()).count();
     if (now - lastUs.load(std::memory_order_relaxed) < 1000) return;
     lastUs.store(now, std::memory_order_relaxed);
     inside = true;

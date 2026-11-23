@@ -16,6 +16,7 @@
 #include "platform/host_platform.h"
 #include "runtime_log.h"
 #include "guest_profiler.h"
+#include "no100f_native_scene.h"
 
 #include <dolphin/gx/GXAurora.h>
 #include <dolphin/vi.h>
@@ -64,6 +65,23 @@ namespace {
 
 using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
+
+// N8 C7: vi clock reads (one counter for the present/wait path, one for the
+// SleepPreciselyUntil spin loop). The 9 design-passes table lines are all
+// inside env-gated diagnostic watchdog threads (off in flights); the real
+// per-present reads are the Clock::now() sites below. Gated on the
+// nativescene dk_diag key (No100fNativeSceneEnabled), one branch per site
+// when off. Counters ride the measurement flight only, never a price build.
+static std::atomic<uint64_t> s_n8ClockVi{0};
+static std::atomic<uint64_t> s_n8ClockViSpin{0};
+static Clock::time_point n8_vi_now() noexcept {
+  if (No100fNativeSceneEnabled()) s_n8ClockVi.fetch_add(1, std::memory_order_relaxed);
+  return Clock::now();
+}
+static Clock::time_point n8_vi_spin_now() noexcept {
+  if (No100fNativeSceneEnabled()) s_n8ClockViSpin.fetch_add(1, std::memory_order_relaxed);
+  return Clock::now();
+}
 
 constexpr uint32_t kGuestGxRenderModeCopyBytes = 0x39;
 
@@ -276,7 +294,7 @@ constexpr std::chrono::microseconds kFinalSpinWindow{500};
 
 void SleepPreciselyUntil(Clock::time_point deadline, bool finishWithSpin = false,
                          std::chrono::microseconds spinWindow = 750us) {
-    const auto now = Clock::now();
+    const auto now = n8_vi_now();  // N8 C7: SleepPreciselyUntil entry read
     if (now >= deadline) {
         return;
     }
@@ -313,13 +331,13 @@ void SleepPreciselyUntil(Clock::time_point deadline, bool finishWithSpin = false
         std::this_thread::sleep_until(deadline);
         return;
     }
-    if (Clock::now() < timerDeadline) {
+    if (n8_vi_now() < timerDeadline) {  // N8 C7: pre-spin check read
         std::this_thread::sleep_until(timerDeadline);
     }
     // This runs only for the final fraction of a VI interval. Do not yield the
     // host thread here: a scheduler quantum is larger than the remaining
     // budget and would recreate the 17-18 ms sawtooth this path removes.
-    while (Clock::now() < deadline) {
+    while (n8_vi_spin_now() < deadline) {  // N8 C7: spin-loop iteration read
 #if defined(_WIN32)
         YieldProcessor();
 #endif
@@ -1127,7 +1145,7 @@ void StartStallWatchdogOnce() {
             }
         }
         std::thread([] {
-            const auto start = std::chrono::steady_clock::now();
+            const auto start = n8_vi_now();  // N8 C7: autoexit watchdog read
             for (const int seconds : {12, 30}) {
                 std::this_thread::sleep_until(start + std::chrono::seconds(seconds));
                 const uint32_t frames = s_presentedXfbFrames.load(std::memory_order_relaxed);
@@ -1183,7 +1201,7 @@ void StartStallWatchdogOnce() {
         // unset the thread does not exist and behaviour is unchanged.
         if (std::getenv("SCOOBY_TRACE_CNT")) {
             std::thread([] {
-                const auto start = std::chrono::steady_clock::now();
+                const auto start = n8_vi_now();  // N8 C7: tracecnt watchdog read
                 uint32_t lastFrames = 0;
                 auto lastPresent = start;
                 auto lastLog = start;
@@ -1195,7 +1213,7 @@ void StartStallWatchdogOnce() {
                 bool pAlarmOk = false;
                 for (;;) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                    const auto now = std::chrono::steady_clock::now();
+                    const auto now = n8_vi_now();  // N8 C7: tracecnt watchdog read
                     const uint32_t frames = s_presentedXfbFrames.load(std::memory_order_relaxed);
                     if (frames != lastFrames) {
                         lastFrames = frames;
@@ -1290,7 +1308,7 @@ void StartStallWatchdogOnce() {
                 constexpr uint32_t kOsHeapTablePtrAddr = 0x80271308u;
                 constexpr uint32_t kRamLo = 0x80000000u;
                 constexpr uint32_t kRamHi = 0x81800000u;  // cached RAM window end (exclusive)
-                const auto start = std::chrono::steady_clock::now();
+                const auto start = n8_vi_now();  // N8 C7: heapwatch watchdog read
                 auto lastHeartbeat = start;
                 uint32_t lastFrames = 0;
                 bool haveFrames = false;
@@ -1299,7 +1317,7 @@ void StartStallWatchdogOnce() {
                 const auto inWindow = [](uint32_t a) { return a >= kRamLo && a < kRamHi; };
                 for (;;) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                    const auto now = std::chrono::steady_clock::now();
+                    const auto now = n8_vi_now();  // N8 C7: heapwatch watchdog read
                     const long long tms =
                         std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count();
                     const uint32_t frames = s_presentedXfbFrames.load(std::memory_order_relaxed);
@@ -1421,7 +1439,7 @@ void StartStallWatchdogOnce() {
             std::thread([] {
                 constexpr uint32_t kRamLo = 0x80000000u;
                 constexpr uint32_t kRamHi = 0x81800000u;  // cached RAM window end (exclusive)
-                const auto start = std::chrono::steady_clock::now();
+                const auto start = n8_vi_now();  // N8 C7: dispwatch watchdog read
                 auto lastHeartbeat = start;
                 uint32_t lastFrames = 0;
                 bool haveFrames = false;
@@ -1429,7 +1447,7 @@ void StartStallWatchdogOnce() {
                 uint32_t prev[12] = {};  // the 9 watched words + fbw / efbh / xfbh
                 for (;;) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(250));
-                    const auto now = std::chrono::steady_clock::now();
+                    const auto now = n8_vi_now();  // N8 C7: dispwatch watchdog read
                     const uint32_t frames = s_presentedXfbFrames.load(std::memory_order_relaxed);
                     const bool framesFrozen = haveFrames && frames == lastFrames;
                     lastFrames = frames;
@@ -1567,7 +1585,7 @@ void StartStallWatchdogOnce() {
                                 : (svcEnv && std::string(svcEnv) == "probe" ? 3 : 0));
             uint32_t bursts = 0;  // burst mode: bursts delivered this boot (cap 3)
             uint32_t lastFrames = s_presentedXfbFrames.load(std::memory_order_relaxed);
-            auto lastPresent = std::chrono::steady_clock::now();
+            auto lastPresent = n8_vi_now();  // N8 C7: stallsvc watchdog read
             bool inEpisode = false;
             uint32_t firings = 0;
             // Feeder-silence bookkeeping: last observed value and last-change time for
@@ -1698,7 +1716,7 @@ void StartStallWatchdogOnce() {
             };
             for (;;) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                const auto now = std::chrono::steady_clock::now();
+                const auto now = n8_vi_now();  // N8 C7: tracewake watchdog read
                 const uint32_t frames = s_presentedXfbFrames.load(std::memory_order_relaxed);
                 uint32_t retraceNow = 0;
                 {
@@ -2520,7 +2538,7 @@ void AdvanceRetrace(CpuContext* ctx, Clock::time_point retraceStamp, bool servic
         g_vi.currentFrameBuffer = g_vi.nextFrameBuffer;
         currentFb = g_vi.currentFrameBuffer;
         g_vi.lastRetrace = retraceStamp;
-        RefreshDisplayLockLocked(Clock::now());
+        RefreshDisplayLockLocked(n8_vi_now());  // N8 C7: retrace lock read
         g_vi.lockedInterval = LockedIntervalAfter(retraceStamp);
         retraceValue = g_vi.retraceCount;
         preCb = g_vi.preRetraceCallback;
@@ -2667,7 +2685,7 @@ bool AdvanceDueRetraces(CpuContext* ctx, int maxToProcess, bool serviceAurora)
                 }
                 g_vi.detLastRetraceTicks = due;
             }
-            AdvanceRetrace(ctx, Clock::now(), serviceAurora);
+            AdvanceRetrace(ctx, n8_vi_now(), serviceAurora);  // N8 C7: AdvanceRetrace read
             advancedAny = true;
         }
         return advancedAny;
@@ -2675,7 +2693,7 @@ bool AdvanceDueRetraces(CpuContext* ctx, int maxToProcess, bool serviceAurora)
 
     for (int catchUpCount = 0; catchUpCount < maxToProcess; ++catchUpCount) {
         Clock::time_point target;
-        auto now = Clock::now();
+        auto now = n8_vi_now();  // N8 C7: AdvanceRetrace read
         {
             std::lock_guard<std::mutex> lock(g_viMutex);
             if (!g_vi.initialized) {
@@ -2799,7 +2817,7 @@ void VI_HLE_WaitForNextRetracePoll() {
         retraceDeadline = g_vi.lastRetrace + ActiveIntervalLocked();
     }
 
-    const auto now = Clock::now();
+    const auto now = n8_vi_now();  // N8 C7: WaitForNextRetracePoll read
     if (now >= retraceDeadline) {
         return;
     }
@@ -2828,7 +2846,7 @@ uint64_t s_lastPresentAnchorNanos = 0;
 void PaceToRetraceBoundary(Clock::time_point deadline) {
     constexpr auto kServiceSlice = 1ms;
     for (;;) {
-        const auto now = Clock::now();
+        const auto now = n8_vi_now();  // N8 C7: PaceToRetraceBoundary read
         if (now >= deadline) {
             break;
         }
@@ -2891,12 +2909,35 @@ void GxFifoWriteTotals(uint64_t* calls, uint64_t* bytes, uint64_t* dlCalls, uint
                        uint64_t* burstBytes);                                      // gx/gx_fifo.cpp
 void GxBeginFrameWaitTotals(uint64_t* nanos, uint64_t* sleeps);                    // gx/gx_frame.cpp
 void GxFifoFastTotals(uint64_t* fastWords, uint64_t* mismatches);                  // gx/gx_fifo.cpp
+void GxL2Totals(uint64_t* sampledCalls, uint64_t* dispatchNanos, uint64_t* storeNanos,
+                uint64_t* wakeNanos, uint64_t* runWords, uint64_t* runs1, uint64_t* runs2_4,
+                uint64_t* runs5_16, uint64_t* runs17);                             // gx/gx_fifo.cpp
+namespace aurora::gfx {
+uint64_t staging_split_count() noexcept;  // gfx/common.cpp
+}  // namespace aurora::gfx
 uint64_t GxBBoxClearCount();                                                           // gx/gx_stubs.cpp
 uint64_t GxBBoxReadCount();                                                            // gx/gx_stubs.cpp
 uint64_t PhaseTimeAudioDelivNanosTotal();                                      // audio/audio.cpp
 uint64_t PhaseTimeFirstPacketNanos();                                          // gx/gx_fifo.cpp
 void PhaseTimeClearFirstPacket();                                              // gx/gx_fifo.cpp
 uint32_t PhaseTimeThreadSnapshot(uint32_t* addrs, uint64_t* nanos, uint64_t* switchesOut);  // os/os_scheduler.cpp
+// N8 counters (Step 2 measurement build): per-site steady_clock reads and the
+// C2/C3/C6 totals, each a total since start (see their definitions). The
+// nativescene getters (No100fDlSiteTotals, No100fGeomTotals,
+// No100fGeomPrintTable) come via no100f_native_scene.h.
+void aurora_n8_totals(uint64_t* xUnmovedBytes, uint64_t* xMovedBytes, uint64_t* xUploads,
+                      uint64_t* processCalls, uint64_t* pipeDistinct,
+                      uint64_t* clockProcTimer, uint64_t* processCallsDl,
+                      uint64_t* processCallsDrain);                      // aurora/command_processor.cpp
+void aurora_n8_clock_totals(uint64_t* waits, uint64_t* present);         // aurora/aurora.cpp
+uint64_t gx_n8_deferred_clock_total();                                   // gx/gx_vertex.cpp
+uint64_t gxframe_n8_clock_total();                                       // gx/gx_frame.cpp
+uint64_t ossched_n8_idle_clock_total();                                  // os/os_scheduler.cpp
+uint64_t ppchelp_n8_timebase_clock_total();                              // ppc_helpers.cpp
+uint64_t ossleep_n8_clock_total();                                       // os/os_sleep.cpp
+uint64_t gxcopy_n8_overlay_clock_total();                                // gx/gx_copy.cpp
+uint64_t osintr_n8_clock_total();                                        // os/os_interrupt.cpp
+uint64_t pad_n8_other_clock_total();                                     // pad.cpp
 
 namespace {
 // A snapshot of those totals; frames take differences.
@@ -2909,7 +2950,9 @@ struct FrameSplit {
              bboxClears = 0, bboxReads = 0, bboxDisarms = 0, bboxArmedVerts = 0, bboxAccumCalls = 0,
              pipeBumps = 0, memoHits = 0, memoMisses = 0, tableHits = 0, tableMisses = 0, gxProcess = 0,
              stageAdmit = 0, stageResolve = 0, stageUploads = 0, stageUniform = 0, stageRecord = 0,
-             stageBBox = 0, audioDeliv = 0;  // phasetime: cumulative host audio-delivery nanos (audio/audio.cpp)
+             stageBBox = 0, audioDeliv = 0,  // phasetime: cumulative host audio-delivery nanos (audio/audio.cpp)
+             l2Sampled = 0, l2DispatchNs = 0, l2StoreNs = 0, l2WakeNs = 0, l2RunWords = 0, l2Runs1 = 0,
+             l2Runs2_4 = 0, l2Runs5_16 = 0, l2Runs17 = 0, stagingSplits = 0;  // L2 counters
     static FrameSplit Now() {
         FrameSplit s;
         GxFifoFastTotals(&s.fastWords, &s.fastMismatches);
@@ -2924,6 +2967,9 @@ struct FrameSplit {
         s.bboxReads = GxBBoxReadCount();
         s.gxProcess = AuroraGxProcessNanosTotal();
         s.audioDeliv = PhaseTimeAudioDelivNanosTotal();
+        GxL2Totals(&s.l2Sampled, &s.l2DispatchNs, &s.l2StoreNs, &s.l2WakeNs, &s.l2RunWords, &s.l2Runs1,
+                   &s.l2Runs2_4, &s.l2Runs5_16, &s.l2Runs17);
+        s.stagingSplits = aurora::gfx::staging_split_count();
         AuroraStageTimerTotals(&s.stageAdmit, &s.stageResolve, &s.stageUploads, &s.stageUniform,
                                &s.stageRecord, &s.stageBBox);
         s.idle = GuestSchedulerIdleNanosTotal();
@@ -2982,7 +3028,134 @@ struct FrameSplit {
         r.stageRecord = stageRecord - o.stageRecord;
         r.stageBBox = stageBBox - o.stageBBox;
         r.audioDeliv = audioDeliv - o.audioDeliv;
+        r.l2Sampled = l2Sampled - o.l2Sampled;
+        r.l2DispatchNs = l2DispatchNs - o.l2DispatchNs;
+        r.l2StoreNs = l2StoreNs - o.l2StoreNs;
+        r.l2WakeNs = l2WakeNs - o.l2WakeNs;
+        r.l2RunWords = l2RunWords - o.l2RunWords;
+        r.l2Runs1 = l2Runs1 - o.l2Runs1;
+        r.l2Runs2_4 = l2Runs2_4 - o.l2Runs2_4;
+        r.l2Runs5_16 = l2Runs5_16 - o.l2Runs5_16;
+        r.l2Runs17 = l2Runs17 - o.l2Runs17;
+        r.stagingSplits = stagingSplits - o.stagingSplits;
         return r;
+    }
+};
+
+// N8 counters snapshot (Step 2 measurement build): the same Now()/operator-
+// shape as FrameSplit, but only the N8 counters. All fields cumulative since
+// start; the window takes differences. The C5 per-identity table is printed
+// separately (No100fGeomPrintTable) once per window from Log().
+struct N8Split {
+    uint64_t xUnmoved, xMoved, xUploads, processCalls, pipeDistinct, clockProcTimer;
+    uint64_t processCallsDl, processCallsDrain;  // L2: C3 split by caller (DL path vs drain path)
+    uint64_t clockAuroraWait, clockAuroraPresent, clockGxDeferred, clockGxFrame, clockOsSchedIdle;
+    uint64_t clockPpcTimeBase, clockOsSleep, clockGxCopy, clockOsIntr, clockPadOther, clockVi;
+    uint64_t clockViSpin, dlAtomicSubs, dlAtomicDraws, dlSectorSubs, dlSectorDraws, dlIm3dSubs;
+    uint64_t dlIm3dDraws, dlOtherSubs, dlOtherDraws, dlUnnotedSubs, dlUnnotedDraws, dlHostSubs;
+    uint64_t geomRenders, geomAllowRenders, geomUncatRenders, geomUnknownRenders, geomSiteDraws, geomDistinct;
+    static N8Split Now() {
+        N8Split s;
+        aurora_n8_totals(&s.xUnmoved, &s.xMoved, &s.xUploads, &s.processCalls, &s.pipeDistinct,
+                         &s.clockProcTimer, &s.processCallsDl, &s.processCallsDrain);
+        aurora_n8_clock_totals(&s.clockAuroraWait, &s.clockAuroraPresent);
+        s.clockGxDeferred = gx_n8_deferred_clock_total();
+        s.clockGxFrame = gxframe_n8_clock_total();
+        s.clockOsSchedIdle = ossched_n8_idle_clock_total();
+        s.clockPpcTimeBase = ppchelp_n8_timebase_clock_total();
+        s.clockOsSleep = ossleep_n8_clock_total();
+        s.clockGxCopy = gxcopy_n8_overlay_clock_total();
+        s.clockOsIntr = osintr_n8_clock_total();
+        s.clockPadOther = pad_n8_other_clock_total();
+        s.clockVi = s_n8ClockVi.load(std::memory_order_relaxed);
+        s.clockViSpin = s_n8ClockViSpin.load(std::memory_order_relaxed);
+        No100fDlSiteTotals(&s.dlAtomicSubs, &s.dlAtomicDraws, &s.dlSectorSubs, &s.dlSectorDraws,
+                           &s.dlIm3dSubs, &s.dlIm3dDraws, &s.dlOtherSubs, &s.dlOtherDraws,
+                           &s.dlUnnotedSubs, &s.dlUnnotedDraws, &s.dlHostSubs);
+        No100fGeomTotals(&s.geomRenders, &s.geomAllowRenders, &s.geomUncatRenders,
+                         &s.geomUnknownRenders, &s.geomSiteDraws, &s.geomDistinct);
+        return s;
+    }
+    N8Split operator-(const N8Split& o) const {
+        N8Split r;
+        r.xUnmoved = xUnmoved - o.xUnmoved;
+        r.xMoved = xMoved - o.xMoved;
+        r.xUploads = xUploads - o.xUploads;
+        r.processCalls = processCalls - o.processCalls;
+        r.processCallsDl = processCallsDl - o.processCallsDl;
+        r.processCallsDrain = processCallsDrain - o.processCallsDrain;
+        r.pipeDistinct = pipeDistinct - o.pipeDistinct;
+        r.clockProcTimer = clockProcTimer - o.clockProcTimer;
+        r.clockAuroraWait = clockAuroraWait - o.clockAuroraWait;
+        r.clockAuroraPresent = clockAuroraPresent - o.clockAuroraPresent;
+        r.clockGxDeferred = clockGxDeferred - o.clockGxDeferred;
+        r.clockGxFrame = clockGxFrame - o.clockGxFrame;
+        r.clockOsSchedIdle = clockOsSchedIdle - o.clockOsSchedIdle;
+        r.clockPpcTimeBase = clockPpcTimeBase - o.clockPpcTimeBase;
+        r.clockOsSleep = clockOsSleep - o.clockOsSleep;
+        r.clockGxCopy = clockGxCopy - o.clockGxCopy;
+        r.clockOsIntr = clockOsIntr - o.clockOsIntr;
+        r.clockPadOther = clockPadOther - o.clockPadOther;
+        r.clockVi = clockVi - o.clockVi;
+        r.clockViSpin = clockViSpin - o.clockViSpin;
+        r.dlAtomicSubs = dlAtomicSubs - o.dlAtomicSubs;
+        r.dlAtomicDraws = dlAtomicDraws - o.dlAtomicDraws;
+        r.dlSectorSubs = dlSectorSubs - o.dlSectorSubs;
+        r.dlSectorDraws = dlSectorDraws - o.dlSectorDraws;
+        r.dlIm3dSubs = dlIm3dSubs - o.dlIm3dSubs;
+        r.dlIm3dDraws = dlIm3dDraws - o.dlIm3dDraws;
+        r.dlOtherSubs = dlOtherSubs - o.dlOtherSubs;
+        r.dlOtherDraws = dlOtherDraws - o.dlOtherDraws;
+        r.dlUnnotedSubs = dlUnnotedSubs - o.dlUnnotedSubs;
+        r.dlUnnotedDraws = dlUnnotedDraws - o.dlUnnotedDraws;
+        r.dlHostSubs = dlHostSubs - o.dlHostSubs;
+        r.geomRenders = geomRenders - o.geomRenders;
+        r.geomAllowRenders = geomAllowRenders - o.geomAllowRenders;
+        r.geomUncatRenders = geomUncatRenders - o.geomUncatRenders;
+        r.geomUnknownRenders = geomUnknownRenders - o.geomUnknownRenders;
+        r.geomSiteDraws = geomSiteDraws - o.geomSiteDraws;
+        r.geomDistinct = geomDistinct - o.geomDistinct;
+        return r;
+    }
+    N8Split& operator+=(const N8Split& o) {
+        xUnmoved += o.xUnmoved;
+        xMoved += o.xMoved;
+        xUploads += o.xUploads;
+        processCalls += o.processCalls;
+        processCallsDl += o.processCallsDl;
+        processCallsDrain += o.processCallsDrain;
+        pipeDistinct += o.pipeDistinct;
+        clockProcTimer += o.clockProcTimer;
+        clockAuroraWait += o.clockAuroraWait;
+        clockAuroraPresent += o.clockAuroraPresent;
+        clockGxDeferred += o.clockGxDeferred;
+        clockGxFrame += o.clockGxFrame;
+        clockOsSchedIdle += o.clockOsSchedIdle;
+        clockPpcTimeBase += o.clockPpcTimeBase;
+        clockOsSleep += o.clockOsSleep;
+        clockGxCopy += o.clockGxCopy;
+        clockOsIntr += o.clockOsIntr;
+        clockPadOther += o.clockPadOther;
+        clockVi += o.clockVi;
+        clockViSpin += o.clockViSpin;
+        dlAtomicSubs += o.dlAtomicSubs;
+        dlAtomicDraws += o.dlAtomicDraws;
+        dlSectorSubs += o.dlSectorSubs;
+        dlSectorDraws += o.dlSectorDraws;
+        dlIm3dSubs += o.dlIm3dSubs;
+        dlIm3dDraws += o.dlIm3dDraws;
+        dlOtherSubs += o.dlOtherSubs;
+        dlOtherDraws += o.dlOtherDraws;
+        dlUnnotedSubs += o.dlUnnotedSubs;
+        dlUnnotedDraws += o.dlUnnotedDraws;
+        dlHostSubs += o.dlHostSubs;
+        geomRenders += o.geomRenders;
+        geomAllowRenders += o.geomAllowRenders;
+        geomUncatRenders += o.geomUncatRenders;
+        geomUnknownRenders += o.geomUnknownRenders;
+        geomSiteDraws += o.geomSiteDraws;
+        geomDistinct += o.geomDistinct;
+        return *this;
     }
 };
 
@@ -2991,6 +3164,7 @@ struct FrameWindow {
     int frames = 0;
     double frameMs = 0, worstMs = 0, gameMs = 0, gxMs = 0, discMs = 0, endFrameMs = 0, paceMs = 0;
     FrameSplit sum;
+    N8Split n8sum;
     // phasetime: per-window exact-span + thread accumulators (added to, never reset mid-window).
     double preSubmitMs = 0, submitMs = 0;
     double threadMainMs = 0, threadOtherMs = 0, threadTopMs = 0;
@@ -3056,6 +3230,16 @@ struct FrameWindow {
         sum.stageUniform += d.stageUniform;
         sum.stageRecord += d.stageRecord;
         sum.stageBBox += d.stageBBox;
+        sum.l2Sampled += d.l2Sampled;
+        sum.l2DispatchNs += d.l2DispatchNs;
+        sum.l2StoreNs += d.l2StoreNs;
+        sum.l2WakeNs += d.l2WakeNs;
+        sum.l2RunWords += d.l2RunWords;
+        sum.l2Runs1 += d.l2Runs1;
+        sum.l2Runs2_4 += d.l2Runs2_4;
+        sum.l2Runs5_16 += d.l2Runs5_16;
+        sum.l2Runs17 += d.l2Runs17;
+        sum.stagingSplits += d.stagingSplits;
         // Aurora's staging use of the last sealed frame (bytes copied to the GPU buffers per frame)
         if (const AuroraStats* st = aurora_get_stats()) {
             vertBytes += st->lastVertSize;
@@ -3067,6 +3251,7 @@ struct FrameWindow {
             mergedDraws += st->mergedDrawCallCount;
         }
     }
+    void AddN8(const N8Split& d) { n8sum += d; }
     double vertBytes = 0, uniformBytes = 0, indexBytes = 0, storageStaged = 0, textureBytes = 0, drawCalls = 0,
            mergedDraws = 0;
     // phasetime: accumulate one frame's per-thread wall time into the window. mainThread is the
@@ -3133,13 +3318,21 @@ struct FrameWindow {
                     threadTopMs / n, static_cast<unsigned>(threadSwitches), sum.audioDeliv / ns, tailMs);
         }
         // Gather-pipe traffic per frame: single-word HleFifoWrite calls (each translated store to the
-        // pipe), how many of them were display-list recording, and the burst path.
+        // pipe), how many of them were display-list recording, and the burst path. The L2 time split
+        // (sampled) and run histogram ride the same line.
+        // L2: the sampled time-split buckets scale by total/sampled calls
+        // (exactly ~64 when nativescene is on; 0 when off, and the buckets read 0).
+        const double l2Scale = sum.l2Sampled > 0 ? static_cast<double>(sum.fifoCalls) / sum.l2Sampled : 0;
         RT_LOGF(RT_TAG_VI,
                 "gxfifo frames %u-%u: per frame %.0f pipe writes (%.0f KiB, %.0f into display lists), %.0f bursts "
-                "(%.0f KiB); fifofast %.0f words appended, %llu mismatches\n",
+                "(%.0f KiB); fifofast %.0f words appended, %llu mismatches; l2 dispatch %.3f ms store %.3f ms "
+                "wake %.3f ms (sampled %.0f calls); runs 1:%.0f 2-4:%.0f 5-16:%.0f 17+:%.0f words %.0f\n",
                 lastFrame - static_cast<uint32_t>(frames) + 1, lastFrame, sum.fifoCalls / n,
                 sum.fifoBytes / (1024.0 * n), sum.fifoDlCalls / n, sum.burstCalls / n, sum.burstBytes / (1024.0 * n),
-                sum.fastWords / n, static_cast<unsigned long long>(sum.fastMismatches));
+                sum.fastWords / n, static_cast<unsigned long long>(sum.fastMismatches),
+                sum.l2DispatchNs * l2Scale / 1e6 / n, sum.l2StoreNs * l2Scale / 1e6 / n,
+                sum.l2WakeNs * l2Scale / 1e6 / n, sum.l2Sampled / n,
+                sum.l2Runs1 / n, sum.l2Runs2_4 / n, sum.l2Runs5_16 / n, sum.l2Runs17 / n, sum.l2RunWords / n);
         // Staging per frame (KiB): what Aurora copied into its GPU buffers, and the vertex-array
         // re-uploads behind the storage share (push_storage: one per indexed array per unmerged draw).
         const double kib = 1024.0 * n;
@@ -3148,14 +3341,42 @@ struct FrameWindow {
                 "push_storage %.0f calls %.0f KiB; draws %.0f (+%.0f merged); storagecache hits %.0f misses %.0f "
                 "skipped %.0f KiB; usedrange uploads %.0f fallbacks %.0f saved %.0f KiB; bbox clears %.0f reads %.0f "
                 "disarms %.0f, armed %.0f verts in %.0f calls; pipeline bumps %.0f, memo hits %.0f misses %.0f, "
-                "table misses %.0f\n",
+                "table misses %.0f, splits %.0f\n",
                 lastFrame - static_cast<uint32_t>(frames) + 1, lastFrame, vertBytes / kib, uniformBytes / kib,
                 indexBytes / kib, storageStaged / kib, textureBytes / kib, sum.storageCalls / n,
                 sum.storageBytes / kib, drawCalls / n, mergedDraws / n, sum.cacheHits / n, sum.cacheMisses / n,
                 sum.cacheSkipped / kib, sum.urUploads / n, sum.urFallbacks / n, sum.urSaved / kib,
                 sum.bboxClears / n, sum.bboxReads / n, sum.bboxDisarms / n, sum.bboxArmedVerts / n,
                 sum.bboxAccumCalls / n, sum.pipeBumps / n, sum.memoHits / n, sum.memoMisses / n,
-                sum.tableMisses / n);
+                sum.tableMisses / n, sum.stagingSplits / n);
+        // N8 counters per frame (Step 2 measurement build): gated on the
+        // nativescene key, so the toggle set reads zero. The C5 per-identity
+        // table follows on its own lines.
+        if (No100fNativeSceneEnabled()) {
+            RT_LOGF(RT_TAG_VI,
+                    "[n8counters] frames %u-%u: xframe uploads %.0f unmoved %.0f KiB moved %.0f KiB; process %.0f "
+                    "calls (dl %.0f drain %.0f); dlsite subs atomic %.0f sector %.0f im3d %.0f other %.0f unnoted %.0f host %.0f | "
+                    "draws atomic %.0f sector %.0f im3d %.0f other %.0f unnoted %.0f; geom renders %.0f allow %.0f "
+                    "uncat %.0f unknown %.0f distinct %.0f siteDraws %.0f; pipeDistinct %.0f; clock proctimer %.0f "
+                    "deferred %.0f gxframe %.0f aurwait %.0f aurpresent %.0f vi %.0f vispin %.0f idle %.0f "
+                    "timebase %.0f ossleep %.0f gxcopy %.0f osintr %.0f other %.0f\n",
+                    lastFrame - static_cast<uint32_t>(frames) + 1, lastFrame, n8sum.xUploads / n,
+                    n8sum.xUnmoved / kib, n8sum.xMoved / kib, n8sum.processCalls / n,
+                    n8sum.processCallsDl / n, n8sum.processCallsDrain / n,
+                    n8sum.dlAtomicSubs / n, n8sum.dlSectorSubs / n, n8sum.dlIm3dSubs / n,
+                    n8sum.dlOtherSubs / n, n8sum.dlUnnotedSubs / n, n8sum.dlHostSubs / n,
+                    n8sum.dlAtomicDraws / n, n8sum.dlSectorDraws / n, n8sum.dlIm3dDraws / n,
+                    n8sum.dlOtherDraws / n, n8sum.dlUnnotedDraws / n,
+                    n8sum.geomRenders / n, n8sum.geomAllowRenders / n, n8sum.geomUncatRenders / n,
+                    n8sum.geomUnknownRenders / n, n8sum.geomDistinct / n, n8sum.geomSiteDraws / n,
+                    n8sum.pipeDistinct / n,
+                    n8sum.clockProcTimer / n, n8sum.clockGxDeferred / n, n8sum.clockGxFrame / n,
+                    n8sum.clockAuroraWait / n, n8sum.clockAuroraPresent / n, n8sum.clockVi / n,
+                    n8sum.clockViSpin / n, n8sum.clockOsSchedIdle / n,
+                    n8sum.clockPpcTimeBase / n, n8sum.clockOsSleep / n, n8sum.clockGxCopy / n,
+                    n8sum.clockOsIntr / n, n8sum.clockPadOther / n);
+            No100fGeomPrintTable();
+        }
         // Per-stage gx split (NO100F_STAGE_TIMERS; nothing prints while the timers are off): the
         // remainder is process minus the timed spans, computed here so the packet loop itself
         // needs no clock reads.
@@ -3777,7 +3998,7 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
     }
     GuestProfiler::OnFramePresented();
     static FrameTimes times;
-    const Clock::time_point presentStart = Clock::now();
+    const Clock::time_point presentStart = n8_vi_now();  // N8 C7: present start read
     const auto ms = [](Clock::duration d) { return std::chrono::duration<double, std::milli>(d).count(); };
     struct SequenceGuard {
         ~SequenceGuard() { s_presentSequenceActive.store(false, std::memory_order_release); }
@@ -3883,9 +4104,9 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
         aurora_set_present_schedule(0, 0);
     }
 
-    const Clock::time_point endFrameStart = Clock::now();
+    const Clock::time_point endFrameStart = n8_vi_now();  // N8 C7: endFrame start read
     aurora_end_frame();
-    const Clock::time_point paceStart = Clock::now();
+    const Clock::time_point paceStart = n8_vi_now();  // N8 C7: pace start read
     if (paceThisFrame) {
         PaceToRetraceBoundary(paceDeadline);
         std::lock_guard<std::mutex> lock(g_viMutex);
@@ -3919,7 +4140,12 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
         static FrameSplit s_lastSplit = split;
         const FrameSplit d = split - s_lastSplit;
         s_lastSplit = split;
-        const Clock::time_point now = Clock::now();
+        // N8 counters: same snapshot/diff shape as the FrameSplit above.
+        const N8Split n8split = N8Split::Now();
+        static N8Split s_lastN8 = n8split;
+        const N8Split n8d = n8split - s_lastN8;
+        s_lastN8 = n8split;
+        const Clock::time_point now = n8_vi_now();  // N8 C7: present read
         // phasetime: take + clear the first-packet stamp for this interval. Taken once per
         // present even when the frame is skipped below, so a boot packet never leaks into the
         // first real frame.
@@ -3980,6 +4206,7 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
             static FrameWindow s_win;
             s_win.Add(frame, game, gxMs, dvdMs, ms(paceStart - endFrameStart), ms(now - paceStart), d,
                       preSubmitMs, submitMs);
+            s_win.AddN8(n8d);
             // phasetime: per-thread wall time for this frame, from the scheduler snapshot diff.
             // The first snapshot after arming only seeds the baseline (the cumulative totals
             // since boot are not this frame's time), so nothing is added for that frame.
@@ -4028,7 +4255,7 @@ void VI_HLE_PresentFrame(bool presentedXfb, bool paceToRetrace) {
         s_lastEnd = now;
     }
     if (LogFpsEnabled() && presentedXfb) {
-        const Clock::time_point now = Clock::now();
+        const Clock::time_point now = n8_vi_now();  // N8 C7: present read
         if (times.lastPresentEnd != Clock::time_point{}) {
             const double game = ms(presentStart - times.lastPresentEnd) + ms(endFrameStart - presentStart);
             const double frame = ms(now - times.lastPresentEnd);
@@ -4390,7 +4617,7 @@ extern "C" void VIGetCurrentLine_HLE_801bac48(CpuContext* ctx)
         interval = ActiveIntervalLocked();
         last = g_vi.lastRetrace;
     }
-    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - last);
+    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(n8_vi_now() - last);  // N8 C7: VIGetCurrentLine read
     if (DetClock::Enabled()) {
         uint64_t lastTicks = 0;
         {
@@ -4447,7 +4674,7 @@ extern "C" void VIWaitForRetrace_HLE_801b99ec(CpuContext* ctx)
             target = g_vi.lastRetrace + interval;
         }
 
-        const auto now = Clock::now();
+        const auto now = n8_vi_now();  // N8 C7: VIWaitForRetrace read
         if (now < target) {
             SleepPreciselyUntil(target, true);
         }

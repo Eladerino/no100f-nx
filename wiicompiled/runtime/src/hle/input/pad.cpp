@@ -9,6 +9,7 @@
 #include "runtime_config.h"
 #include "runtime_log.h"
 #include "no100f_devmenu.h"
+#include "../no100f_native_scene.h"
 
 #include <aurora/aurora.h>
 #include <SDL3/SDL_gamepad.h>
@@ -214,6 +215,20 @@ extern "C" uint32_t PAD__Init_HLE()
 PPC_NATIVE_OVERRIDE(800012CC, PAD__Init_HLE, uint32_t, (), ());
 
 // PADRead: gathers every GameCube pad source for the frame and writes the statuses to guest memory.
+// N8 C7: padwatch clock read (the "other" bucket; padwatch is env-gated on
+// SCOOBY_PADWATCH, off in flights, so this reads ~0). Gated on the
+// nativescene dk_diag key (No100fNativeSceneEnabled), one branch per site
+// when off. The static pwStart init is boot-only and not counted. Counters
+// ride the measurement flight only, never a price build.
+static std::atomic<uint64_t> s_n8ClockPadOther{0};
+static std::chrono::steady_clock::time_point n8_pad_now() noexcept {
+  if (No100fNativeSceneEnabled()) s_n8ClockPadOther.fetch_add(1, std::memory_order_relaxed);
+  return std::chrono::steady_clock::now();
+}
+uint64_t pad_n8_other_clock_total() {
+  return s_n8ClockPadOther.load(std::memory_order_relaxed);
+}
+
 extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
 {
     if (statusPtr == 0) {
@@ -306,9 +321,10 @@ extern "C" uint32_t PAD__Read_HLE(uint32_t statusPtr)
         static uint32_t pwLast[PAD_CHANMAX][3] = {};
         static bool pwHave[PAD_CHANMAX] = {};
         ++pwCalls;
+        const auto n8now = n8_pad_now();  // N8 C7: padwatch read (other bucket)
         const long long pwMs = static_cast<long long>(
             std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - pwStart).count());
+                n8now - pwStart).count());
         for (uint32_t i = 0; i < PAD_CHANMAX; ++i) {
             const PADStatus& st = statuses[i];
             const uint32_t w0 = static_cast<uint32_t>(st.button) |

@@ -56,6 +56,8 @@ void diag_init() {
         if (std::strstr(line, "s0probe")) g_diag.s0Probe = !off;
         if (std::strstr(line, "stagetimers")) g_diag.stageTimers = !off;
         if (std::strstr(line, "nativescene")) g_diag.nativeScene = !off;
+        if (std::strstr(line, "n8c2off")) g_diag.n8c2off = !off;
+        if (std::strstr(line, "n9")) g_diag.n9 = !off;
         if (std::strstr(line, "dlcensus")) g_diag.dlCensus = !off;
         if (const char* wd = std::strstr(line, "watchdogat=")) g_diag.watchdogAt = std::atoi(wd + 11);
         if (std::strstr(line, "traceio")) g_diag.traceIo = !off;
@@ -95,6 +97,8 @@ void diag_init() {
     if (g_diag.s0Probe) setenv("NO100F_S0PROBE", "1", 1);
     if (g_diag.stageTimers) setenv("NO100F_STAGE_TIMERS", "1", 1);
     if (g_diag.nativeScene) setenv("NO100F_NATIVESCENE", "1", 1);
+    if (g_diag.n8c2off) setenv("NO100F_N8C2OFF", "1", 1);
+    if (g_diag.n9) setenv("NO100F_N9", "1", 1);
     if (g_diag.dlCensus) setenv("NO100F_DLCENSUS", "1", 1);
     // Same handshake for the runtime's stall watchdog (runtime hle/vi.cpp): one extra mark at
     // the given uptime in seconds, read once by the watchdog thread.
@@ -134,13 +138,13 @@ void diag_init() {
     // with the self-check) and the per-word diagnostic ring, both read once at the first pipe write.
     if (g_diag.fifoFast) setenv("NO100F_FIFO_FAST", g_diag.fifoFast == 2 ? "2" : "1", 1);
     if (g_diag.pipeRing) setenv("NO100F_PIPE_RING", "1", 1);
-    dklog("diag: depth_off=%d cull_off=%d magenta=%d picdump=%d efbclear=%d bufdump=%d texdump=%d shaderdump=%d nomerge=%d uvlog=%d mtxlog=%d perftimer=%d arrayup=%d cachedstaging=%d storagecache=%d fifofast=%d pipering=%d usedrange=%d watchdogat=%d traceio=%d tracecnt=%d stallsvc=%s tracewake=%d parkwatch=%d seamfix=%d padwatch=%d fix2=%d heapwatch=%d dispwatch=%d safepoint=%d spinwatch=%d phasetime=%d dlcensus=%d",
+    dklog("diag: depth_off=%d cull_off=%d magenta=%d picdump=%d efbclear=%d bufdump=%d texdump=%d shaderdump=%d nomerge=%d uvlog=%d mtxlog=%d perftimer=%d arrayup=%d cachedstaging=%d storagecache=%d fifofast=%d pipering=%d usedrange=%d watchdogat=%d traceio=%d tracecnt=%d stallsvc=%s tracewake=%d parkwatch=%d seamfix=%d padwatch=%d fix2=%d heapwatch=%d dispwatch=%d safepoint=%d spinwatch=%d phasetime=%d dlcensus=%d n9=%d n8c2off=%d",
           g_diag.depthOff ? 1 : 0, g_diag.cullOff ? 1 : 0, g_diag.magenta ? 1 : 0, g_diag.picDump ? 1 : 0,
           g_diag.efbClear ? 1 : 0, g_diag.bufDump ? 1 : 0, g_diag.texDump ? 1 : 0, g_diag.shaderDump ? 1 : 0,
           g_diag.noMerge ? 1 : 0, g_diag.uvLog ? 1 : 0, g_diag.mtxLog ? 1 : 0, g_diag.perfTimer ? 1 : 0,
           g_diag.arrayUp ? 1 : 0, g_diag.cachedStaging ? 1 : 0, g_diag.storageCache ? 1 : 0, g_diag.fifoFast,
           g_diag.pipeRing ? 1 : 0, g_diag.usedRange ? 1 : 0, g_diag.watchdogAt, g_diag.traceIo ? 1 : 0,
-          g_diag.traceCnt ? 1 : 0, g_diag.stallSvc == 1 ? "count" : (g_diag.stallSvc == 2 ? "burst" : (g_diag.stallSvc == 3 ? "probe" : "off")), g_diag.traceWake ? 1 : 0, g_diag.parkWatch ? 1 : 0, g_diag.seamFix ? 1 : 0, g_diag.padWatch ? 1 : 0, g_diag.fix2 ? 1 : 0, g_diag.heapWatch ? 1 : 0, g_diag.dispWatch ? 1 : 0, g_diag.safePoint ? 1 : 0, g_diag.spinWatch ? 1 : 0, g_diag.phaseTime ? 1 : 0, g_diag.dlCensus ? 1 : 0);
+          g_diag.traceCnt ? 1 : 0, g_diag.stallSvc == 1 ? "count" : (g_diag.stallSvc == 2 ? "burst" : (g_diag.stallSvc == 3 ? "probe" : "off")), g_diag.traceWake ? 1 : 0, g_diag.parkWatch ? 1 : 0, g_diag.seamFix ? 1 : 0, g_diag.padWatch ? 1 : 0, g_diag.fix2 ? 1 : 0, g_diag.heapWatch ? 1 : 0, g_diag.dispWatch ? 1 : 0, g_diag.safePoint ? 1 : 0, g_diag.spinWatch ? 1 : 0, g_diag.phaseTime ? 1 : 0, g_diag.dlCensus ? 1 : 0, g_diag.n9 ? 1 : 0, g_diag.n8c2off ? 1 : 0);
 }
 
 namespace {

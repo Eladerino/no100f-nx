@@ -8,7 +8,7 @@
 # --audit compiles only the runtime's sources for the Switch (no game, no Dawn, no Aurora): the quick
 #   check after an upstream merge. It needs no translation.
 # --out DIR stages the NRO and its companion files, laid out like the SD card, in DIR/switch/no100f-nx/.
-#   DIR defaults to Downloads\no100f-nx-sd in your Windows profile under WSL; --out none skips it.
+#   DIR defaults to Switch Ports\FrightWorks\no100f-nx-sd in your Windows profile under WSL; --out none skips it.
 # --game also stages your extracted disc (Disc/DATA) as DIR/switch/no100f-nx/game. It is about 1.4 GB
 
 # --variant pgo is the instrumented PGO capture build (FW_PGO_INSTRUMENT + FW_PGO_ALL: the
@@ -237,7 +237,7 @@ if [[ $out == auto ]]; then
     out=
     if command -v wslpath >/dev/null && command -v cmd.exe >/dev/null; then
         profile=$(cd /mnt/c 2>/dev/null && cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')
-        [[ -n $profile ]] && out=$(wslpath -u "$profile")/Downloads/no100f-nx-sd
+        [[ -n $profile ]] && out=$(wslpath -u "$profile")/Switch Ports/FrightWorks/no100f-nx-sd
     fi
 fi
 if [[ -n $out && $out != none ]]; then

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include "gx_internal.h"
+#include "no100f_native_scene.h"
 #include "runtime_log.h"
 
 extern "C" void __GXSetSUTexRegs();
@@ -128,6 +129,9 @@ uint64_t GxBBoxReadCount() { return s_gxBBoxReads.load(std::memory_order_relaxed
 
 extern "C" void GX__ClearBoundingBox_8016fecc() {
     s_gxBBoxClears.fetch_add(1, std::memory_order_relaxed);
+    // N9: mirror the clear into the nativescene counters (N4 diagnosis §3.2,
+    // candidate 7 falsifier); printed by PrintCounters' periodic dump.
+    No100fNativeSceneCountBboxClear();
     GxBBoxClear();
     GXClearBoundingBox();
     try {
@@ -140,6 +144,9 @@ PPC_NATIVE_OVERRIDE_VOID(800ff040, GX__ClearBoundingBox_8016fecc, (), ());
 // GXReadBoundingBox (this SDK's order: left, top, right, bottom).
 extern "C" void GX__ReadBoundingBox_Gc(uint32_t leftPtr, uint32_t topPtr, uint32_t rightPtr, uint32_t bottomPtr) {
     s_gxBBoxReads.fetch_add(1, std::memory_order_relaxed);
+    // N9: mirror the read into the nativescene counters (N4 diagnosis §3.2,
+    // candidate 7 falsifier); printed by PrintCounters' periodic dump.
+    No100fNativeSceneCountBboxRead();
     uint16_t l = 0, t = 0, r = 0, b = 0;
     GxBBoxRead(l, t, r, b);
     {   // union with Aurora's CPU-projected box, which also sees display-list and FIFO draws

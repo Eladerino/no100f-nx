@@ -600,6 +600,97 @@ static bool handle_aurora(const u8* data, u32& pos, u32 size, bool bigEndian);
 std::atomic<uint64_t> g_statProcessNanos{0}, g_statLockNanos{0}, g_statDraws{0};
 std::atomic<uint64_t> g_statProcessTotalNanos{0};  // never reset: slow-frame breakdowns take deltas
 std::atomic<uint64_t> g_statLockTotalNanos{0};     // never reset: the renderer-lock share of the above
+// N8 counters (Step 2 measurement build; see N8-COUNTER-BUILD-LOG.md):
+// C2 cross-frame generation map, C3 process() calls, C6 distinct pipeline
+// states, C7 ProcessTimer/lock clock reads. All cumulative; all gated on
+// the nativescene dk_diag key. Aurora must not depend on the runtime
+// nativescene TU, so the gate is a file-local getenv check, one branch
+// per site when off, in the N6 n9-gating mould. Counters ride the
+// measurement flight only, never a price build.
+static bool n8_counters_enabled() {
+  static const bool on = std::getenv("NO100F_NATIVESCENE") != nullptr;
+  return on;
+}
+extern "C" int g_gxFrameCount;  // vi frame counter, one per presented frame (gx_copy.cpp)
+struct N8XEntry {
+  uint64_t generation = 0;
+  int frame = -1;             // g_gxFrameCount of the last upload of this range
+  bool wasUnmoved = false;    // verdict of that frame's first upload (same-frame duplicates reuse it)
+};
+static absl::flat_hash_map<std::pair<const void*, uint32_t>, N8XEntry> s_n8XMap;
+static std::atomic<uint64_t> s_n8XUnmovedBytes{0};
+static std::atomic<uint64_t> s_n8XMovedBytes{0};
+static std::atomic<uint64_t> s_n8XUploads{0};
+static std::atomic<uint64_t> s_n8ProcessCalls{0};
+static std::atomic<uint64_t> s_n8ProcessCallsDl{0};     // L2: C3 split, DL path
+static std::atomic<uint64_t> s_n8ProcessCallsDrain{0};  // L2: C3 split, drain path
+static absl::flat_hash_set<HashType> s_n8PipeSet;
+static std::mutex s_n8PipeMutex;
+static std::atomic<uint64_t> s_n8ClockProcTimer{0};
+// L2: split C3 by caller. Called from the two fifo::process call sites:
+// process_display_list (DL path) and fifo::drain (drain path). The entry
+// counter stays the total; DL + drain sum to it.
+void n8_note_process_caller(bool fromDrain) {
+  if (!n8_counters_enabled()) return;
+  if (fromDrain) s_n8ProcessCallsDrain.fetch_add(1, std::memory_order_relaxed);
+  else s_n8ProcessCallsDl.fetch_add(1, std::memory_order_relaxed);
+}
+// C7: one inline counting wrapper per read site (counts READS; the
+// profile's 0.46 ms total then determines the implied per-read cost).
+static std::chrono::steady_clock::time_point n8_proc_now() noexcept {
+  if (n8_counters_enabled()) s_n8ClockProcTimer.fetch_add(1, std::memory_order_relaxed);
+  return std::chrono::steady_clock::now();
+}
+// C2: record one upload of (ptr, size) against the previous frame.
+// Strict rule: unmoved iff the range was uploaded last frame with the
+// same generation. Boundary is the vi frame counter, NOT the staging
+// epoch (the epoch also changes on capacity splits/resumes, so it is
+// not a frame boundary). Untracked ranges count as moved and leave the
+// map untouched (conservative). Single map plus a stored per-frame
+// verdict: equivalent to a prev/current double map for the strict
+// previous-frame question, with no per-frame swap.
+static bool n8_c2_digest_off() {
+  // L2: C2 digest-isolation toggle (dk_diag n8c2off, NO100F_N8C2OFF). When
+  // on, n8_xframe_note returns before the generation lookup, so one NRO
+  // can fly with C2 on (L2 pricing + F1 close) and with C2 off (the digest
+  // cost isolated against the 41.73 ms anchor). The C2 counters read zero
+  // on the C2-off launch; that launch's deliverable is its frame price.
+  static const bool off = std::getenv("NO100F_N8C2OFF") != nullptr;
+  return off;
+}
+static void n8_xframe_note(const void* ptr, uint32_t size) {
+  if (!n8_counters_enabled()) return;
+  if (n8_c2_digest_off()) return;
+  const int frame = g_gxFrameCount;
+  const uint64_t gen = aurora::guest_write_generation(ptr, size);
+  s_n8XUploads.fetch_add(1, std::memory_order_relaxed);
+  if (gen == aurora::kGuestWriteUntracked) {
+    s_n8XMovedBytes.fetch_add(size, std::memory_order_relaxed);
+    return;
+  }
+  const auto key = std::make_pair(ptr, size);
+  auto it = s_n8XMap.find(key);
+  if (it != s_n8XMap.end() && it->second.frame == frame) {
+    // Same-frame re-upload: reuse the first upload's verdict.
+    if (it->second.wasUnmoved) {
+      s_n8XUnmovedBytes.fetch_add(size, std::memory_order_relaxed);
+    } else {
+      s_n8XMovedBytes.fetch_add(size, std::memory_order_relaxed);
+    }
+    return;
+  }
+  const bool unmoved = it != s_n8XMap.end() && it->second.frame == frame - 1 &&
+                       aurora::guest_write_generation_matches(it->second.generation, gen);
+  if (unmoved) {
+    s_n8XUnmovedBytes.fetch_add(size, std::memory_order_relaxed);
+  } else {
+    s_n8XMovedBytes.fetch_add(size, std::memory_order_relaxed);
+  }
+  if (it == s_n8XMap.end()) it = s_n8XMap.emplace(key, N8XEntry{}).first;
+  it->second.generation = gen;
+  it->second.frame = frame;
+  it->second.wasUnmoved = unmoved;
+}
 thread_local int t_statDepth = 0;  // only the outermost of nested process()/raw draws counts
 // Timed on Windows always (the slow-frame log splits a frame into GX and the rest), elsewhere only
 // while the runtime logs frame times (NO100F_LOG_FPS): two clock reads per outermost call add up on a
@@ -618,13 +709,14 @@ struct ProcessTimer {
   std::chrono::steady_clock::time_point start{};
   ProcessTimer() {
     if (StatTiming() && t_statDepth++ == 0) {
-      start = std::chrono::steady_clock::now();
+      start = n8_proc_now();  // N8 C7: ProcessTimer ctor read
     }
   }
   ~ProcessTimer() {
     if (StatTiming() && --t_statDepth == 0) {
+      const auto end = n8_proc_now();  // N8 C7: ProcessTimer dtor read
       const auto elapsed =
-          std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+          std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
       g_statProcessTotalNanos.fetch_add(elapsed, std::memory_order_relaxed);
       g_statProcessNanos.fetch_add(elapsed,
                                    std::memory_order_relaxed);
@@ -692,12 +784,17 @@ static void note_write(u32 kind, u32 reg, u32 value, bool wasDirty) {
 uint32_t process(const u8* data, u32 size, bool bigEndian) {
   ZoneScoped;
   ProcessTimer timer;
+  // N8 C3: one increment per process() call. Callers: process_display_list's
+  // loop (GXDispList.cpp:24) and fifo::drain's loop (fifo.cpp:88); the L2
+  // caller split counts each site separately (n8_note_process_caller).
+  if (n8_counters_enabled()) s_n8ProcessCalls.fetch_add(1, std::memory_order_relaxed);
   // Everything decoded here mutates renderer state (GX state, the recorded command lists and the mapped staging buffers), so take the renderer GPU mutex once for the whole drain rather than once per draw command.
-  const auto lockStart = StatTiming() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  const auto lockStart = StatTiming() ? n8_proc_now() : std::chrono::steady_clock::time_point{};  // N8 C7: lock-start read
   std::lock_guard gpuLock(aurora::renderer_gpu_mutex());
   if (StatTiming()) {
+    const auto lockEnd = n8_proc_now();  // N8 C7: lock-end read
     const auto lockNanos =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - lockStart).count();
+        std::chrono::duration_cast<std::chrono::nanoseconds>(lockEnd - lockStart).count();
     g_statLockNanos.fetch_add(lockNanos, std::memory_order_relaxed);
     g_statLockTotalNanos.fetch_add(lockNanos, std::memory_order_relaxed);
   }
@@ -2428,6 +2525,11 @@ static const CachedPipelineState& cached_pipeline_state(const PipelineConfig& co
   }
 
   g_statPipelineTableMisses.fetch_add(1, std::memory_order_relaxed);
+  // N8 C6: distinct pipeline states created (one set insert per memo miss only, not per draw).
+  if (n8_counters_enabled()) {
+    std::lock_guard<std::mutex> lock(s_n8PipeMutex);
+    s_n8PipeSet.insert(hash);
+  }
   entry.valid = true;
   entry.config = config;
   entry.state = {
@@ -3433,6 +3535,8 @@ bool storage_cache_enabled() noexcept {
 }
 
 gfx::Range storage_cached_upload(const void* data, uint32_t size) {
+  // N8 C2: before the cache-enabled early return, so it measures even when storagecache is off.
+  if (data != nullptr && size != 0) n8_xframe_note(data, size);
   if (!storage_cache_enabled() || data == nullptr || size == 0) {
     return gfx::push_storage(static_cast<const uint8_t*>(data), size);
   }
@@ -4014,6 +4118,25 @@ void aurora_pipeline_memo_totals(uint64_t* bumps, uint64_t* memoHits, uint64_t* 
   *memoMisses = aurora::gx::fifo::g_statMemoMisses.load(std::memory_order_relaxed);
   *tableHits = aurora::gx::fifo::g_statPipelineTableHits.load(std::memory_order_relaxed);
   *tableMisses = aurora::gx::fifo::g_statPipelineTableMisses.load(std::memory_order_relaxed);
+}
+
+// N8 counters since start (C2 cross-frame uploads, C3 process() calls, C6 distinct
+// pipeline states, C7 ProcessTimer clock reads): the runtime's [n8counters] line.
+void aurora_n8_totals(uint64_t* xUnmovedBytes, uint64_t* xMovedBytes, uint64_t* xUploads,
+                      uint64_t* processCalls, uint64_t* pipeDistinct,
+                      uint64_t* clockProcTimer, uint64_t* processCallsDl,
+                      uint64_t* processCallsDrain) {
+  *xUnmovedBytes = aurora::gx::fifo::s_n8XUnmovedBytes.load(std::memory_order_relaxed);
+  *xMovedBytes = aurora::gx::fifo::s_n8XMovedBytes.load(std::memory_order_relaxed);
+  *xUploads = aurora::gx::fifo::s_n8XUploads.load(std::memory_order_relaxed);
+  *processCalls = aurora::gx::fifo::s_n8ProcessCalls.load(std::memory_order_relaxed);
+  *processCallsDl = aurora::gx::fifo::s_n8ProcessCallsDl.load(std::memory_order_relaxed);
+  *processCallsDrain = aurora::gx::fifo::s_n8ProcessCallsDrain.load(std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(aurora::gx::fifo::s_n8PipeMutex);
+    *pipeDistinct = static_cast<uint64_t>(aurora::gx::fifo::s_n8PipeSet.size());
+  }
+  *clockProcTimer = aurora::gx::fifo::s_n8ClockProcTimer.load(std::memory_order_relaxed);
 }
 
 // Per-stage gx timer totals since start (NO100F_STAGE_TIMERS): the runtime's gxstage line.

@@ -21,6 +21,7 @@ static void process_display_list(const u8* data, u32 nbytes, bool bigEndian) {
   u32 consumed = 0;
   bool retried = false;
   while (consumed < nbytes) {
+    aurora::gx::fifo::n8_note_process_caller(false);  // L2: DL-path process() call
     const u32 count = aurora::gx::fifo::process(data + consumed, nbytes - consumed, bigEndian);
     if (count == 0 && retried)
       throw aurora::gfx::StagingCapacityError("display list draw does not fit after capacity submission");
