@@ -637,9 +637,22 @@ void n8_note_process_caller(bool fromDrain) {
 }
 // C7: one inline counting wrapper per read site (counts READS; the
 // profile's 0.46 ms total then determines the implied per-read cost).
-static std::chrono::steady_clock::time_point n8_proc_now() noexcept {
+// L6: the gx stat clock, in nanoseconds. On Switch this reads the ARM generic timer
+// (cntpct_el0, fixed 19.2 MHz on Tegra X1) directly instead of going through
+// steady_clock::now() -> clock_gettime -> libnx, and converts ticks to ns inline
+// (ns = ticks * 625 / 12, exact for 19.2 MHz). Resolution is one tick (about 52 ns),
+// which is fine for sums over thousands of spans per frame. Elsewhere it is steady_clock.
+static uint64_t n8_proc_now() noexcept {
   if (n8_counters_enabled()) s_n8ClockProcTimer.fetch_add(1, std::memory_order_relaxed);
-  return std::chrono::steady_clock::now();
+#if defined(__SWITCH__) && defined(__aarch64__)
+  uint64_t ticks;
+  asm volatile("mrs %0, cntpct_el0" : "=r"(ticks));
+  return ticks / 12u * 625u + (ticks % 12u) * 625u / 12u;
+#else
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count());
+#endif
 }
 // C2: record one upload of (ptr, size) against the previous frame.
 // Strict rule: unmoved iff the range was uploaded last frame with the
@@ -706,7 +719,7 @@ static bool StatTiming() {
 #endif
 }
 struct ProcessTimer {
-  std::chrono::steady_clock::time_point start{};
+  uint64_t start = 0;
   ProcessTimer() {
     if (StatTiming() && t_statDepth++ == 0) {
       start = n8_proc_now();  // N8 C7: ProcessTimer ctor read
@@ -714,9 +727,8 @@ struct ProcessTimer {
   }
   ~ProcessTimer() {
     if (StatTiming() && --t_statDepth == 0) {
-      const auto end = n8_proc_now();  // N8 C7: ProcessTimer dtor read
-      const auto elapsed =
-          std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+      const uint64_t end = n8_proc_now();  // N8 C7: ProcessTimer dtor read
+      const uint64_t elapsed = end - start;
       g_statProcessTotalNanos.fetch_add(elapsed, std::memory_order_relaxed);
       g_statProcessNanos.fetch_add(elapsed,
                                    std::memory_order_relaxed);
@@ -789,14 +801,19 @@ uint32_t process(const u8* data, u32 size, bool bigEndian) {
   // caller split counts each site separately (n8_note_process_caller).
   if (n8_counters_enabled()) s_n8ProcessCalls.fetch_add(1, std::memory_order_relaxed);
   // Everything decoded here mutates renderer state (GX state, the recorded command lists and the mapped staging buffers), so take the renderer GPU mutex once for the whole drain rather than once per draw command.
-  const auto lockStart = StatTiming() ? n8_proc_now() : std::chrono::steady_clock::time_point{};  // N8 C7: lock-start read
-  std::lock_guard gpuLock(aurora::renderer_gpu_mutex());
-  if (StatTiming()) {
-    const auto lockEnd = n8_proc_now();  // N8 C7: lock-end read
-    const auto lockNanos =
-        std::chrono::duration_cast<std::chrono::nanoseconds>(lockEnd - lockStart).count();
-    g_statLockNanos.fetch_add(lockNanos, std::memory_order_relaxed);
-    g_statLockTotalNanos.fetch_add(lockNanos, std::memory_order_relaxed);
+  // L6: try the lock first. Uncontended (the common case) there is nothing to wait for,
+  // so the wait is recorded as zero and no clock is read; the two lock-timing reads only
+  // happen when another thread actually holds the mutex. The lock bucket keeps meaning
+  // "time spent waiting for the renderer lock".
+  std::unique_lock gpuLock(aurora::renderer_gpu_mutex(), std::try_to_lock);
+  if (!gpuLock.owns_lock()) {
+    const uint64_t lockStart = StatTiming() ? n8_proc_now() : 0;  // N8 C7: lock-start read (contended only)
+    gpuLock.lock();
+    if (StatTiming()) {
+      const uint64_t lockNanos = n8_proc_now() - lockStart;  // N8 C7: lock-end read (contended only)
+      g_statLockNanos.fetch_add(lockNanos, std::memory_order_relaxed);
+      g_statLockTotalNanos.fetch_add(lockNanos, std::memory_order_relaxed);
+    }
   }
   u32 pos = 0;
 
