@@ -214,12 +214,15 @@ set(RECOMP_TRANSLATED_PPC_FP_OPTIONS -fno-fast-math -ffp-contract=off)
 # code is.
 # no100f_particles_update.cpp is a native copy of game code and must match it bit for bit without
 # fps60: fast-math would erase the rounding in PPC_Fmadds, so particle sizes would be cut, not rounded.
+# no100f_rpskin.cpp is the native RpSkin kernel for func_80144E8C and must match the translated
+# kernel bit for bit (see tests/no100f_rpskin_tests.cpp), so it gets the same FP policy.
 set(RECOMP_PPC_SEMANTIC_RUNTIME_SOURCES
     "${CMAKE_CURRENT_LIST_DIR}/src/ppc_helpers.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/fpu_helpers.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/ppc_quantized.cpp"
     "${CMAKE_CURRENT_LIST_DIR}/src/hle/input/kpad.cpp"
-    "${CMAKE_CURRENT_LIST_DIR}/src/hle/no100f_particles_update.cpp")
+    "${CMAKE_CURRENT_LIST_DIR}/src/hle/no100f_particles_update.cpp"
+    "${CMAKE_CURRENT_LIST_DIR}/src/hle/no100f_rpskin.cpp")
 set_source_files_properties(${RECOMP_PPC_SEMANTIC_RUNTIME_SOURCES} PROPERTIES
     SKIP_UNITY_BUILD_INCLUSION ON
     SKIP_PRECOMPILE_HEADERS ON
@@ -497,6 +500,12 @@ add_executable(no100f_particles_update_tests "${CMAKE_CURRENT_LIST_DIR}/tests/no
 target_include_directories(no100f_particles_update_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
 target_compile_features(no100f_particles_update_tests PRIVATE cxx_std_17)
 add_test(NAME no100f_particles_update_tests COMMAND no100f_particles_update_tests)
+
+add_executable(no100f_rpskin_tests "${CMAKE_CURRENT_LIST_DIR}/tests/no100f_rpskin_tests.cpp")
+target_include_directories(no100f_rpskin_tests PRIVATE "${CMAKE_CURRENT_LIST_DIR}/include")
+target_compile_features(no100f_rpskin_tests PRIVATE cxx_std_17)
+target_compile_options(no100f_rpskin_tests PRIVATE ${RECOMP_TRANSLATED_PPC_FP_OPTIONS})
+add_test(NAME no100f_rpskin_tests COMMAND no100f_rpskin_tests)
 
 add_executable(no100f_ax_address_sync_tests "${CMAKE_CURRENT_LIST_DIR}/tests/no100f_ax_address_sync_tests.cpp")
 target_compile_features(no100f_ax_address_sync_tests PRIVATE cxx_std_17)
